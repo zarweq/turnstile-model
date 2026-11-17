@@ -388,8 +388,8 @@ def autosetup(sources, seconds=180, params=None, model=None, review=True, cam_di
             saved.append(save_camera(cfg, cam_dir))
         elif choice == "m" and review:
             cv2.destroyWindow("autosetup")
-            setup_mode(str(Path(cam_dir) / f"{name}.json"), sources[name], camera=name)
-            saved.append(Path(cam_dir) / f"{name}.json")
+            if setup_mode(str(Path(cam_dir) / f"{name}.json"), sources[name], camera=name):
+                saved.append(Path(cam_dir) / f"{name}.json")
     if review:
         cv2.destroyAllWindows()
     missing = [n for n in sources if n not in seen]

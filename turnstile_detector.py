@@ -533,91 +533,32 @@ def grab_frame(source):
     return frame
 
 
-def click_segments(frame, n, gate_pts, title):
-    """Разметка n отрезков (по 2 клика): верх тумбы / линия ограждения вдоль, по которой нельзя перелезать."""
-    import cv2
-    pts = []
-    if n <= 0:
-        return []
-
-    def on_click(event, x, y, *_):
-        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2 * n:
-            pts.append((x, y))
-
-    cv2.setMouseCallback("setup", on_click)
-    while len(pts) < 2 * n:
-        view = frame.copy()
-        for k in range(4):
-            cv2.line(view, gate_pts[k], gate_pts[(k + 1) % 4], (255, 200, 0), 1)
-        cv2.line(view, gate_pts[4], gate_pts[5], (0, 0, 255), 2)
-        for k in range(0, len(pts) - 1, 2):
-            cv2.line(view, pts[k], pts[k + 1], (255, 0, 255), 2)
-        for q in pts:
-            cv2.circle(view, q, 4, (255, 0, 255), -1)
-        cv2.putText(view, f"{title} {len(pts) // 2 + 1}/{n}: point {len(pts) % 2 + 1}/2", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.imshow("setup", view)
-        if cv2.waitKey(30) == 27:
-            sys.exit("Отменено")
-    return [[list(pts[k]), list(pts[k + 1])] for k in range(0, 2 * n, 2)]
-
-
 def setup_mode(config_path, source, camera=None):
-    import cv2
+    """Ручная разметка: 3 клика на проём (две стойки и индикатор), подсказки на картинке."""
+    from hud import Painter
+    from setup_ui import mark_gates
     if not source:
         sys.exit("Для --setup укажи --source \"ссылка или файл\"")
     frame0 = grab_frame(source)
     camera = camera or input("Название камеры (например CAM-01): ").strip() or "camera"
-    n_gates = int(input("Сколько проёмов турникета видно в кадре? [1]: ").strip() or 1)
-    anchor = "center" if (input("Камера смотрит: 1 — сбоку, 2 — сверху [1]: ").strip() or "1") == "2" else "foot"
-    steps = ["zone 1/4", "zone 2/4", "zone 3/4", "zone 4/4", "line 1/2", "line 2/2",
-             "indicator top-left", "indicator bottom-right"]
-    print("\nДля каждого проёма 8 кликов:\n"
-          "  1-4: углы зоны проёма (площадка между створками, по кругу)\n"
-          "  5-6: линия поперёк проёма (от стойки до стойки)\n"
-          "  7-8: левый верхний и правый нижний угол индикатора (купол с окантовкой, с небольшим запасом)\n")
-    gates = []
-    for gi in range(n_gates):
-        frame, pts = frame0.copy(), []
-
-        def on_click(event, x, y, *_):
-            if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 8:
-                pts.append((x, y))
-
-        cv2.namedWindow("setup")
-        cv2.setMouseCallback("setup", on_click)
-        while len(pts) < 8:
-            view = frame.copy()
-            for q in pts:
-                cv2.circle(view, q, 4, (0, 0, 255), -1)
-            if len(pts) >= 4:
-                for k in range(4):
-                    cv2.line(view, pts[k], pts[(k + 1) % 4], (255, 200, 0), 2)
-            if len(pts) >= 6:
-                cv2.line(view, pts[4], pts[5], (0, 0, 255), 2)
-            cv2.putText(view, f"gate {gi + 1}/{n_gates}: click {steps[len(pts)]}", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.imshow("setup", view)
-            if cv2.waitKey(30) == 27:
-                sys.exit("Отменено")
-        (x1, y1), (x2, y2) = pts[6], pts[7]
-        kind = "cargo" if (input(f"Проём {gi + 1}: 1 — обычный турникет, 2 — грузовые ворота [1]: ").strip()
-                           or "1") == "2" else "turnstile"
-        n_bar = int(input(f"Проём {gi + 1}: сколько тумб/ограждений разметить для CLIMB (по 2 клика) [0]: ")
-                    .strip() or 0)
-        barriers = click_segments(frame0, n_bar, pts, f"gate {gi + 1}/{n_gates} barrier")
-        gates.append({"name": chr(ord("A") + gi), "kind": kind, "zone": pts[:4], "line": pts[4:6],
-                      "indicator": [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)],
-                      "barriers": barriers, "allowed_direction": 1})
-    cv2.destroyAllWindows()
+    anchor = "center" if (input("Камера смотрит: 1 — сбоку/под углом, 2 — прямо сверху [1]: ").strip()
+                          or "1") == "2" else "foot"
+    print("\nОткрываю кадр. На каждый проём 3 клика: стойка, вторая стойка, индикатор. "
+          "Подсказки — вверху картинки. Backspace или правая кнопка мыши — отменить клик.")
+    gates = mark_gates(frame0, Painter(ru=True), f"Setup {camera}")
+    if not gates:
+        print("Разметка отменена, ничего не сохранено.")
+        return False
     # масштаб для грузовых ворот: ширина обычного турникета в этом же кадре, иначе половина ширины ворот
     normal = [dist(g["line"][0], g["line"][1]) for g in gates if g["kind"] == "turnstile"]
     for g in gates:
         if g["kind"] == "cargo":
             g["scale"] = round(statistics.median(normal) if normal else dist(g["line"][0], g["line"][1]) / 2, 1)
     cfg = {"camera": camera, "source": source, "anchor": anchor, "gates": gates, "params": {}}
+    Path(config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(config_path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Сохранено в {config_path}. Параметры можно менять в разделе \"params\" этого файла.")
+    print(f"Сохранено в {config_path}: проёмов {len(gates)}.")
+    return True
 
 
 def calib_mode(cfg, params):
