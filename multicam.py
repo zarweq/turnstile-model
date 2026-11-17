@@ -460,6 +460,10 @@ def wizard(observe_sec=180, cam_dir=CAM_DIR, links_path=LINKS):
                 print(f"\n--- {n} ---")
                 setup_mode(str(cam_dir / f"{n}.json"), s, camera=n)
         else:
+            mins = _ask(f"Сколько минут наблюдать? Нужно хотя бы 3 прохода через каждый проём "
+                        f"(Enter — {observe_sec // 60}): ")
+            if mins.replace(",", ".").replace(".", "", 1).isdigit():
+                observe_sec = int(float(mins.replace(",", ".")) * 60)
             autosetup(new, observe_sec, params, review=True, cam_dir=cam_dir)
     cfgs = [c for c in load_cameras(cam_dir, links_path) if c.get("camera") in links]
     if not cfgs:
