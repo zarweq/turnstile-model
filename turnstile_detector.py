@@ -89,6 +89,7 @@ class Params:
     kp_conf: float = 0.4           # минимальная уверенность точки кисти
     imgsz: int = 640
     process_fps: float = 0.0       # видеофайл: сколько кадров в секунду анализировать (0 — все)
+    sound: bool = True             # звуковой сигнал при тревоге (Windows)
 
 
 # Тревоги, которые относятся к конкретному проходу конкретного человека: каждая пишется,
@@ -692,9 +693,63 @@ def build_persons(res, anchor_mode, kp_conf):
     return persons
 
 
+# подписи на экране (OpenCV не рисует кириллицу, поэтому латиница)
+KIND_LABEL = {"NO_GREEN": "pass without green", "ZONE": "2+ people in gate", "WIDE": "two in one box",
+              "HANDOVER": "card handover", "LIMIT": "escort limit", "CLIMB": "climb over",
+              "REVERSE": "wrong direction"}
+WINDOW = "Turnstile detector  (q - exit, f - fullscreen, space - pause)"
+
+
+def beep():
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONHAND)        # асинхронно, не тормозит видео
+    except Exception:
+        pass
+
+
+def draw_hud(cv2, view, alerts, totals, now, paused=False):
+    """Баннер последней тревоги, список последних тревог и счётчики — прямо на кадре."""
+    h, w = view.shape[:2]
+    sc = max(0.5, min(1.2, w / 1280))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    th = max(1, int(2 * sc))
+    if alerts and now - alerts[-1][0] < 4.0:
+        _, clock, gate, kind = alerts[-1]
+        bh = int(48 * sc)
+        cv2.rectangle(view, (0, 0), (w, bh), (0, 0, 200), -1)
+        cv2.putText(view, f"VIOLATION  gate {gate}: {kind} - {KIND_LABEL.get(kind, '')}  [{clock}]",
+                    (10, int(bh * 0.7)), font, 0.8 * sc, (255, 255, 255), th)
+    # последние тревоги справа
+    y = int(80 * sc)
+    for _, clock, gate, kind in list(alerts)[-6:][::-1]:
+        txt = f"{clock} {gate} {kind}"
+        (tw, _), _ = cv2.getTextSize(txt, font, 0.55 * sc, th)
+        cv2.rectangle(view, (w - tw - 16, y - int(20 * sc)), (w - 4, y + int(6 * sc)), (0, 0, 0), -1)
+        cv2.putText(view, txt, (w - tw - 10, y), font, 0.55 * sc, (80, 80, 255), th)
+        y += int(30 * sc)
+    # счётчики внизу
+    txt = "  ".join(f"{k}:{v}" for k, v in totals.most_common()) or "no violations"
+    txt = ("PAUSED  " if paused else "") + txt
+    cv2.rectangle(view, (0, h - int(34 * sc)), (w, h), (0, 0, 0), -1)
+    cv2.putText(view, txt, (10, h - int(10 * sc)), font, 0.6 * sc, (255, 255, 255), th)
+
+
+def waiting_frame(cv2, size, text):
+    import numpy as np
+    w, h = size
+    img = np.zeros((h, w, 3), np.uint8)
+    cv2.putText(img, text, (30, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    return img
+
+
 def run(cfg, params, show=True):
     import cv2
-    from ultralytics import YOLO
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        sys.exit("Не установлены зависимости. Запусти start.bat (Windows) или start.command (Mac) "
+                 "либо выполни: pip install -r requirements.txt")
 
     source = cfg["source"]
     file_mode = is_file_source(source)
@@ -712,6 +767,11 @@ def run(cfg, params, show=True):
         reader, frame_i = None, 0
     else:
         reader, last_n = LatestFrame(source), 0
+    alerts, totals = deque(maxlen=50), Counter()
+    paused, fullscreen, last_frame_wall, size = False, False, time.time(), (960, 540)
+    if show:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW, *size)
     print("Запущено. Выход — q в окне или Ctrl+C.")
 
     try:
@@ -729,8 +789,14 @@ def run(cfg, params, show=True):
             else:
                 frame, last_n = reader.get(last_n)
                 if frame is None:
-                    time.sleep(0.005)
+                    if show and time.time() - last_frame_wall > 3:
+                        cv2.imshow(WINDOW, waiting_frame(cv2, size, "Waiting for video stream... (link may be expired)"))
+                        if cv2.waitKey(200) & 0xFF == ord("q"):
+                            break
+                    else:
+                        time.sleep(0.005)
                     continue
+                last_frame_wall = time.time()
                 t = time.time()
                 stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -769,10 +835,31 @@ def run(cfg, params, show=True):
                     cv2.putText(shot, f"{e['gate']}: {e['kind']}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                     out.violation(stamp, e, shot)
+                    alerts.append((time.time(), stamp[-8:] if not file_mode else stamp, e["gate"], e["kind"]))
+                    totals[e["kind"]] += 1
+                    if params.sound and show:
+                        beep()
 
             if show:
-                cv2.imshow("detector", view)
-                if cv2.waitKey(1) == ord("q"):
+                size = (view.shape[1], view.shape[0])
+                draw_hud(cv2, view, alerts, totals, time.time())
+                cv2.imshow(WINDOW, view)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord(" ") and file_mode:              # пауза — только для записи
+                    paused = True
+                    draw_hud(cv2, view, alerts, totals, time.time(), paused=True)
+                    cv2.imshow(WINDOW, view)
+                    while paused:
+                        key = cv2.waitKey(50) & 0xFF
+                        if key in (ord(" "), ord("q")):
+                            paused = False
+                if key == ord("f"):
+                    fullscreen = not fullscreen
+                    cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN,
+                                          cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+                if key == ord("q"):
+                    break
+                if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_AUTOSIZE) < 0:  # окно закрыли крестиком
                     break
     except KeyboardInterrupt:
         pass
@@ -789,7 +876,47 @@ def run(cfg, params, show=True):
     print("Остановлено. Результаты в папке", out.dir)
 
 
+def ask(prompt, default=""):
+    try:
+        v = input(prompt).strip().strip('"')
+    except EOFError:
+        v = ""
+    return v or default
+
+
+def quick_start(config_path="cam.json"):
+    """Запуск без параметров: всё спрашивается по шагам, дальше работает окно с видео."""
+    print("=== Детектор нарушений прохода ===\n")
+    path = Path(config_path)
+    if not path.exists():
+        print("Камера ещё не настроена. Нужна ссылка на поток (index.m3u8 из «Аргуса» или RTSP) "
+              "или путь к видеофайлу.")
+        source = ask("Ссылка или файл: ")
+        if not source:
+            sys.exit("Ссылка не указана")
+        print("\nСейчас откроется кадр: отметь кликами зону, линию и индикатор каждого проёма.")
+        setup_mode(config_path, source)
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        print(f"Камера: {cfg.get('camera', '?')}, проёмов: {len(cfg.get('gates', []))}")
+        print(f"Текущий источник: {cfg.get('source')}")
+        print("Ссылка из «Аргуса» живёт около суток — если она старая, вставь новую.")
+        source = ask("Новая ссылка (Enter — оставить прежнюю, s — разметить заново): ")
+        if source.lower() == "s":
+            setup_mode(config_path, ask("Ссылка или файл для разметки: ", cfg.get("source", "")))
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        elif source:
+            cfg["source"] = source
+            path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    _, params = load_config(config_path)
+    print("\nОткрываю окно. Клавиши: q — выход, f — во весь экран, пробел — пауза (для записи).")
+    run(cfg, params, show=True)
+
+
 def main():
+    if len(sys.argv) == 1:
+        return quick_start()
     ap = argparse.ArgumentParser(description="Детекция нарушений прохода через турникет")
     ap.add_argument("--config", default="cam.json")
     ap.add_argument("--source", help="ссылка на поток (RTSP / m3u8) или видеофайл; заменяет source из конфига")

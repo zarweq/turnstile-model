@@ -83,3 +83,17 @@ def test_memory_is_bounded():
         tid = int(t // 2)
         g.update(t, [walker(tid, tid * 2.0, t)], (t % 2.0) < 0.3)
     assert len(g.counted) < 10 and len(g.last_pos) < 10 and len(g.sessions) < 40
+
+
+def test_quick_start_updates_link(tmp_path, monkeypatch):
+    import json
+    import turnstile_detector as td
+    cfg_path = tmp_path / "cam.json"
+    cfg_path.write_text(json.dumps({"camera": "C", "source": "old", "gates": [SELFTEST_CFG],
+                                    "params": {"green_frames": 3}}), encoding="utf-8")
+    monkeypatch.setattr("builtins.input", lambda _: "https://new/index.m3u8")
+    seen = {}
+    monkeypatch.setattr(td, "run", lambda cfg, params, show: seen.update(src=cfg["source"], gf=params.green_frames))
+    td.quick_start(str(cfg_path))
+    assert seen == {"src": "https://new/index.m3u8", "gf": 3}
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["source"] == "https://new/index.m3u8"
