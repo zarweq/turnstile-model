@@ -633,18 +633,21 @@ def wizard(observe_sec=180, cam_dir=CAM_DIR, links_path=LINKS):
     if choice == "a":
         new.update({c["camera"]: c["source"] for c in today})
     if new:
-        how = _ask(f"Разметка {len(new)} камер: Enter — автоматически (~{observe_sec // 60} мин), "
-                   "m — вручную (3 клика на проём): ").lower()
-        if how == "m":
-            for n, src in new.items():
-                print(f"\n--- {n} ---")
-                setup_mode(str(cam_dir / f"{n}.json"), src, camera=n)
-        else:
+        print(f"\nРазметка {len(new)} новых камер. Как размечать?\n"
+              "  Enter — по картинке: программа сама ищет турникеты, вы проверяете и поправляете мышкой\n"
+              f"  p     — по проходам людей: смотрит видео ~{observe_sec // 60} мин (нужны люди)\n"
+              "  m     — вручную с нуля (3 клика на проём)")
+        how = _ask("Выбор: ").lower()
+        if how == "p":
             mins = _ask(f"Сколько минут наблюдать? Нужно хотя бы 3 прохода через каждый проём "
                         f"(Enter — {observe_sec // 60}): ")
             if mins.replace(",", ".").replace(".", "", 1).isdigit():
                 observe_sec = int(float(mins.replace(",", ".")) * 60)
             autosetup(new, observe_sec, params, review=True, cam_dir=cam_dir)
+        else:
+            for n, src in new.items():
+                print(f"\n--- {n} ---")
+                setup_mode(str(cam_dir / f"{n}.json"), src, camera=n, auto=how != "m", anchor="foot")
         marked = all_cameras(cam_dir)
         today = [c for c in today if c["camera"] not in new]
         today += [marked[n] for n in new if n in marked and marked[n].get("gates")]

@@ -533,8 +533,9 @@ def grab_frame(source):
     return frame
 
 
-def setup_mode(config_path, source, camera=None):
-    """Ручная разметка: 3 клика на проём (две стойки и индикатор), подсказки на картинке."""
+def setup_mode(config_path, source, camera=None, auto=False, anchor=None):
+    """Разметка в окне: 3 клика на проём (две стойки и индикатор), подсказки на картинке.
+    auto=True — сначала программа сама ищет турникеты по картинке (без людей) и открывает предложение."""
     from hud import Painter
     from setup_ui import mark_gates
     if not source:
@@ -544,11 +545,19 @@ def setup_mode(config_path, source, camera=None):
     if frame0 is None:
         sys.exit("Не удалось получить кадр — проверь ссылку (она могла протухнуть)")
     camera = camera or input("Название камеры (например CAM-01): ").strip() or "camera"
-    anchor = "center" if (input("Камера смотрит: 1 — сбоку/под углом, 2 — прямо сверху [1]: ").strip()
-                          or "1") == "2" else "foot"
-    print("\nОткрываю кадр. На каждый проём 3 клика: стойка, вторая стойка, индикатор. "
-          "Подсказки — вверху картинки. Backspace или правая кнопка мыши — отменить клик.")
-    gates = mark_gates(frame0, Painter(ru=True), f"Setup {camera}")
+    anchor = anchor or ("center" if (input("Камера смотрит: 1 — сбоку/под углом, 2 — прямо сверху [1]: ").strip()
+                                      or "1") == "2" else "foot")
+    proposal = None
+    if auto:
+        from autosetup import propose_static
+        print(f"{camera}: ищу турникеты на картинке...")
+        proposal, notes = propose_static(frame0)
+        print(f"   найдено проёмов: {len(proposal)}")
+        for n in notes:
+            print("   -", n)
+    print("\nОткрываю кадр. Подсказки — вверху картинки. Точки можно тащить мышкой; новый проём — 3 клика: "
+          "стойка, вторая стойка, индикатор. Backspace или правая кнопка мыши — отменить клик.")
+    gates = mark_gates(frame0, Painter(ru=True), f"Setup {camera}", proposal)
     if not gates:
         print("Разметка отменена, ничего не сохранено.")
         return False

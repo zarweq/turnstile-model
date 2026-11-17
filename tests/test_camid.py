@@ -110,7 +110,7 @@ def test_wizard_pasted_links(tmp_path, monkeypatch):
     multicam.save_camera({"camera": "CAM-01", "source": "old", "gates": [td.SELFTEST_CFG]}, cams, scene(1))
     a = video(tmp_path / "a.avi", scene(5))                     # новая
     b = video(tmp_path / "b.avi", other_day(scene(1), 3))       # это CAM-01
-    answers = iter([f"смотри: {a}", b, "", "y", "", "", "5"])   # вставка, пустая строка, ru, старт, авто, 5 мин
+    answers = iter([f"смотри: {a}", b, "", "y", "", "p", "5"])  # вставка, пустая строка, ru, старт, по людям, 5 мин
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     calls = {}
 

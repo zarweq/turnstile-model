@@ -19,6 +19,8 @@ autosetup.py — автоматическая разметка проёмов п
 Enter — принять, m — разметить вручную, s — пропустить камеру.
 """
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -237,3 +239,150 @@ def draw_markup(frame, cfg, notes=()):
         y -= 20
     return img
 
+
+
+# ============================ РАЗМЕТКА ПО ОДНОЙ КАРТИНКЕ (БЕЗ ЛЮДЕЙ) ============================
+# Стойки турникетов ищет нейросеть YOLOE по словам («turnstile», «speed gate», ...). Смысл слов посчитан
+# заранее и лежит в models/turnstile_prompts.pt, поэтому на рабочем компьютере не нужен CLIP.
+# Нейросеть находит не все стойки и иногда путает с ними киоски и стойки указателей, поэтому:
+#   * стойка без огонька индикатора (красного/зелёного) отбрасывается, если огоньки в кадре вообще есть;
+#   * огонёк в ряду стоек, которого не накрыла ни одна найденная стойка, — пропущенная стойка;
+#   * проход — промежуток между соседними стойками, линия — по полу от одной стойки к другой.
+# Результат — предложение: он открывается в редакторе, где точки можно перетащить.
+
+PROMPTS_FILE = Path(__file__).with_name("models") / "turnstile_prompts.pt"
+STAND_NAMES = {"turnstile", "speed gate", "tripod turnstile", "security gate", "turnstile gate",
+               "access control gate", "barrier gate"}
+_STAND_MODEL = None
+
+
+def stand_model(weights="yoloe-11s-seg.pt"):
+    """YOLOE с готовыми эмбеддингами слов. None — если ultralytics/торч нет или файл не скачался."""
+    global _STAND_MODEL
+    if _STAND_MODEL is None:
+        try:
+            import torch
+            from ultralytics import YOLOE
+            d = torch.load(PROMPTS_FILE, map_location="cpu")
+            m = YOLOE(weights)
+            m.set_classes(d["names"], d["pe"])
+            _STAND_MODEL = m
+        except Exception as e:                                   # нет сети, старая версия и т.п.
+            print(f"  (поиск стоек нейросетью недоступен: {e}; ищу только по индикаторам)")
+            _STAND_MODEL = False
+    return _STAND_MODEL or None
+
+
+def find_lights(frame, max_area_frac=0.004, s_min=90, v_min=100):
+    """Огоньки индикаторов на одном кадре: маленькие насыщенные красные/зелёные пятна."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    bright = (s >= s_min) & (v >= v_min)
+    out = []
+    for color, mask in (("red", bright & ((h <= 10) | (h >= 170))), ("green", bright & (h >= 40) & (h <= 90))):
+        m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        n, _, st, _ = cv2.connectedComponentsWithStats(m)
+        for i in range(1, n):
+            x, y, w, hh, a = st[i]
+            if 6 <= a <= max_area_frac * m.size and w <= 4 * hh + 3 and hh <= 4 * w + 3:
+                out.append({"box": [int(x), int(y), int(x + w), int(y + hh)], "color": color})
+    return out
+
+
+def _inside(box, outer, pad=0.15):
+    w, h = outer[2] - outer[0], outer[3] - outer[1]
+    cx, cy = _center(box)
+    return outer[0] - pad * w <= cx <= outer[2] + pad * w and outer[1] - pad * h <= cy <= outer[3] + pad * h
+
+
+def _iou(a, b):
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    return inter / max(1e-6, (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+
+
+def detect_stands(frame, model=None, conf=0.15):
+    """Рамки стоек от нейросети (без людей), похожие рамки склеены."""
+    model = model if model is not None else stand_model()
+    if model is None:
+        return []
+    r = model.predict(frame, conf=conf, verbose=False)[0]
+    boxes = []
+    for b, c, p in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist(), r.boxes.conf.tolist()):
+        if r.names[int(c)] in STAND_NAMES:
+            boxes.append({"box": [int(v) for v in b], "conf": float(p), "src": "nn"})
+    boxes.sort(key=lambda s: -s["conf"])
+    keep = []
+    for s in boxes:
+        if all(_iou(s["box"], k["box"]) < 0.4 and not _inside(s["box"], k["box"], 0) for k in keep):
+            keep.append(s)
+    return keep
+
+
+def propose_static(frame, stands=None, lights=None, model=None):
+    """Предложение разметки по одной картинке: (список проёмов, заметки)."""
+    notes = []
+    lights = find_lights(frame) if lights is None else lights
+    stands = detect_stands(frame, model) if stands is None else [dict(s) for s in stands]
+    for s_ in stands:                                    # стойка без огонька — сомнительная, но не выбрасываем
+        s_["lit"] = any(_inside(l_["box"], s_["box"]) for l_ in lights)
+    if not stands:
+        notes.append("стойки турникетов не найдены — нужна ручная разметка (m)")
+        return [], notes
+    widths = [s["box"][2] - s["box"][0] for s in stands]
+    heights = [s["box"][3] - s["box"][1] for s in stands]
+    sw, sh = float(np.median(widths)), float(np.median(heights))
+    tops, bottoms = [s["box"][1] for s in stands], [s["box"][3] for s in stands]
+    x_lo, x_hi = min(s["box"][0] for s in stands) - 2.5 * sw, max(s["box"][2] for s in stands) + 2.5 * sw
+    # огоньки в полосе стоек, не попавшие ни в одну стойку, — пропущенные нейросетью стойки
+    for l_ in lights:
+        cx, cy = _center(l_["box"])
+        if any(_inside(l_["box"], s["box"]) for s in stands) or not (x_lo <= cx <= x_hi):
+            continue
+        if not (min(tops) - 0.3 * sh <= cy <= min(bottoms) - 0.3 * sh):
+            continue
+        if any(s["src"] == "light" and abs(_center(s["box"])[0] - cx) < 0.6 * sw for s in stands):
+            continue
+        bottom = float(np.median(bottoms))
+        stands.append({"box": [int(cx - sw / 2), int(min(cy - 0.1 * sh, bottom - sh)), int(cx + sw / 2), int(bottom)],
+                       "conf": 0.0, "src": "light", "lit": True})
+    added = sum(s["src"] == "light" for s in stands)
+    if added:
+        notes.append(f"добавлено стоек по огонькам индикаторов: {added}")
+    stands.sort(key=lambda s: (s["box"][0] + s["box"][2]) / 2)
+    pairs = [(L, R) for L, R in zip(stands, stands[1:])
+             if -0.2 * sw <= R["box"][0] - L["box"][2] <= 4.0 * sw and abs(R["box"][3] - L["box"][3]) <= 0.6 * sh]
+    gaps = [max(1.0, R["box"][0] - L["box"][2]) for L, R in pairs]
+    med_gap = float(np.median(gaps)) if gaps else 0.0
+    gates = []
+    for L, R in pairs:
+        gap = R["box"][0] - L["box"][2]
+        a = (int(L["box"][2]), int(L["box"][3]))
+        b = (int(R["box"][0]), int(R["box"][3]))
+        if dist(a, b) < 0.3 * sw:
+            continue
+        mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+        own = [l_ for l_ in lights if _inside(l_["box"], L["box"]) or _inside(l_["box"], R["box"])]
+        if own:
+            ind = min(own, key=lambda l_: dist(_center(l_["box"]), mid))["box"]
+            pad = max(2, (ind[2] - ind[0]) // 2)
+            ind = [ind[0] - pad, ind[1] - pad, ind[2] + pad, ind[3] + pad]
+        else:
+            t = L["box"]
+            ind = [int(t[2] - 0.5 * sw), int(t[1]), int(t[2]), int(t[1] + 0.25 * sw)]
+        from setup_ui import zone_around
+        gates.append({"name": chr(ord("A") + len(gates)), "kind": "turnstile", "line": [list(a), list(b)],
+                      "zone": zone_around(a, b), "indicator": [max(0, v) for v in ind], "barriers": [],
+                      "allowed_direction": 1,
+                      "auto": {"static": True, "stands": [L["src"], R["src"]],
+                               "check": not own or not (L["lit"] or R["lit"]) or (len(gaps) > 1 and gap > 1.7 * med_gap),
+                               "why": "нет огонька" if not own else
+                                      ("слишком широкий — возможно, пропущена стойка"
+                                       if len(gaps) > 1 and gap > 1.7 * med_gap else "")}})
+    if not gates:
+        notes.append(f"найдено стоек: {len(stands)}, но проходов между ними не получилось — разметьте вручную")
+    for g in gates:
+        if g["auto"]["check"]:
+            notes.append(f"проём {g['name']}: проверьте ({g['auto']['why'] or 'стойки без огоньков'})")
+    return gates, notes
