@@ -1,0 +1,29 @@
+{
+  "camera": "CAM-01",
+  "source": "rtsp://user:pass@10.0.0.10/stream1",
+  "anchor": "foot",
+  "gates": [
+    {
+      "name": "A",
+      "kind": "turnstile",
+      "zone": [[410, 300], [520, 300], [540, 470], [400, 470]],
+      "line": [[405, 390], [535, 390]],
+      "indicator": [450, 230, 480, 255],
+      "barriers": [[[535, 390], [640, 390]]],
+      "allowed_direction": 1
+    },
+    {
+      "name": "G",
+      "kind": "cargo",
+      "zone": [[700, 320], [900, 320], [900, 460], [700, 460]],
+      "line": [[700, 390], [900, 390]],
+      "indicator": [905, 250, 925, 270],
+      "scale": 130,
+      "allowed_direction": 1
+    }
+  ],
+  "params": {
+    "green_frames": 2,
+    "process_fps": 10
+  }
+}
