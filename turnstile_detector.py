@@ -539,7 +539,10 @@ def setup_mode(config_path, source, camera=None):
     from setup_ui import mark_gates
     if not source:
         sys.exit("Для --setup укажи --source \"ссылка или файл\"")
-    frame0 = grab_frame(source)
+    from camid import grab_frame as grab_scene
+    frame0 = grab_scene(source)                 # медиана нескольких кадров: без проходящих людей
+    if frame0 is None:
+        sys.exit("Не удалось получить кадр — проверь ссылку (она могла протухнуть)")
     camera = camera or input("Название камеры (например CAM-01): ").strip() or "camera"
     anchor = "center" if (input("Камера смотрит: 1 — сбоку/под углом, 2 — прямо сверху [1]: ").strip()
                           or "1") == "2" else "foot"
@@ -557,6 +560,10 @@ def setup_mode(config_path, source, camera=None):
     cfg = {"camera": camera, "source": source, "anchor": anchor, "gates": gates, "params": {}}
     Path(config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(config_path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    import cv2
+    ok, buf = cv2.imencode(".jpg", frame0)                   # образец вида: по нему камера узнаётся завтра
+    if ok:
+        Path(config_path).with_name(f"{Path(config_path).stem}_ref.jpg").write_bytes(buf.tobytes())
     print(f"Сохранено в {config_path}: проёмов {len(gates)}.")
     return True
 
@@ -857,12 +864,20 @@ def main():
         if args.ru:
             gp["ru_text"] = True
         if args.auto:
-            sources = {args.camera: args.source} if args.source else multicam.read_links()
-            if not sources:
-                sys.exit("Нет ссылок: укажи --source или заполни links.txt")
-            multicam.autosetup(sources, args.observe, multicam.make_params(gp), review=not args.no_show)
+            if args.source:
+                sources = {args.camera: args.source}
+            else:
+                pairs = multicam.collect_links()
+                if not pairs:
+                    sys.exit("Нет ссылок: укажи --source или заполни links.txt")
+                _, sources, _ = multicam.resolve_links(pairs)      # размечаются только новые камеры
+            if sources:
+                multicam.autosetup(sources, args.observe, multicam.make_params(gp), review=not args.no_show)
         if args.multi:
-            multicam.run_many(multicam.load_cameras(), gp, show=not args.no_show)
+            today, new, _ = multicam.resolve_links(multicam.collect_links())
+            if new:
+                print("Не размечены (запусти --auto или start.bat):", ", ".join(new))
+            multicam.run_many(today, gp, show=not args.no_show)
         return
     if args.setup:
         return setup_mode(args.config, args.source)

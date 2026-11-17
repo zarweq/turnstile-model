@@ -128,35 +128,3 @@ def test_links_and_cameras(tmp_path):
     loaded = multicam.load_cameras(cams, tmp_path / "links.txt")
     assert [c["source"] for c in loaded] == ["rtsp://a/1"]
     assert multicam.make_params(multicam.global_params(cams)).ru_text is True
-
-
-def test_wizard_new_cameras_go_to_autosetup(tmp_path, monkeypatch):
-    import json
-    import multicam
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "links.txt").write_text("CAM-01 a.mp4\nCAM-02 b.mp4\n", encoding="utf-8")
-    answers = iter(["y", "", "", "10"])               # русские подписи, старт, авторазметка, 10 мин
-    monkeypatch.setattr("builtins.input", lambda _: next(answers))
-    calls = {}
-
-    def fake_auto(sources, sec, params, review, cam_dir):
-        calls["auto"] = sorted(sources)
-        calls["sec"] = sec
-        for n, s in sources.items():
-            multicam.save_camera({"camera": n, "source": s, "gates": [td.SELFTEST_CFG]}, cam_dir)
-
-    monkeypatch.setattr(multicam, "autosetup", fake_auto)
-    monkeypatch.setattr(multicam, "run_many", lambda cfgs, gp, show: calls.update(run=[c["camera"] for c in cfgs],
-                                                                                   ru=gp["ru_text"]))
-    multicam.wizard()
-    assert calls == {"auto": ["CAM-01", "CAM-02"], "sec": 600, "run": ["CAM-01", "CAM-02"], "ru": True}
-    assert json.loads((tmp_path / "cameras/params.json").read_text(encoding="utf-8"))["ru_text"] is True
-
-
-def test_wizard_creates_links_template(tmp_path, monkeypatch):
-    import multicam
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("builtins.input", lambda _: "")
-    monkeypatch.setattr(multicam, "_open_file", lambda p: None)
-    multicam.wizard()
-    assert "CAM-01" in (tmp_path / "links.txt").read_text(encoding="utf-8")

@@ -19,11 +19,14 @@ multicam.py — одна программа на все камеры объек�
 
 import csv
 import json
+import re
 import sys
 import time
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
 
 from turnstile_detector import (GateLogic, LatestFrame, Output, Params, WINDOW, build_persons, draw_overlay,
                                 green_share, is_file_source, need_yolo, setup_mode)
@@ -33,27 +36,63 @@ LINKS = Path("links.txt")
 
 
 # ============================ КОНФИГИ И ССЫЛКИ ============================
-def read_links(path=LINKS):
-    links = {}
-    if not Path(path).exists():
-        return links
-    for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
+NAME_RE = re.compile(r"^[\w.\-]{1,32}$")          # CAM-07, Этаж3_лево; слова с «:» и т.п. — не имя
+
+
+def _is_name(s):
+    return bool(NAME_RE.match(s)) and any(ch.isdigit() for ch in s)
+
+
+def parse_links(text):
+    """Строки со ссылками в любом виде: «ссылка», «ИМЯ ссылка», путь к видеофайлу, мусор вокруг.
+    Возвращает [(подсказка-имя или None, ссылка)]. Имя нужно только старым камерам без образца вида."""
+    from camid import extract_urls
+    out, seen = [], set()
+    for line in (text or "").splitlines():
+        line = line.strip().strip('"')
         if not line or line.startswith("#"):
             continue
-        parts = line.split(None, 1)
-        if len(parts) == 2:
-            links[parts[0]] = parts[1].strip().strip('"')
-    return links
+        urls = extract_urls(line)
+        if not urls:                                    # видеофайлы: любое слово строки, которое есть на диске
+            whole = line.split(None, 1)[-1].strip().strip('"')
+            urls = [whole] if Path(whole).is_file() else \
+                [t.strip('"') for t in line.split() if Path(t.strip('"')).is_file()]
+        first = line.split(None, 1)[0]
+        hint = first if len(line.split(None, 1)) == 2 and _is_name(first) and not Path(first).is_file() \
+            else None
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                out.append((hint if len(urls) == 1 else None, u))
+    return out
+
+
+def collect_links(links_path=LINKS, har_dir="."):
+    """Ссылки из links.txt и из всех HAR-файлов в папке программы."""
+    from camid import urls_from_har
+    pairs = parse_links(Path(links_path).read_text(encoding="utf-8-sig")) if Path(links_path).exists() else []
+    seen = {u for _, u in pairs}
+    for har in sorted(Path(har_dir).glob("*.har")):
+        for u in urls_from_har(har):
+            if u not in seen:
+                seen.add(u)
+                pairs.append((None, u))
+    return pairs
+
+
+def read_links(path=LINKS):
+    """Старый формат «ИМЯ ссылка»: {имя: ссылка}. Строки без имени пропускаются."""
+    return {h: u for h, u in parse_links(Path(path).read_text(encoding="utf-8-sig")) if h} \
+        if Path(path).exists() else {}
 
 
 def write_links_template(path=LINKS):
     Path(path).write_text(
-        "# Одна строка — одна камера: НАЗВАНИЕ  ССЫЛКА\n"
+        "# Вставьте сюда ссылки на камеры — по одной на строку, В ЛЮБОМ ПОРЯДКЕ, имена не нужны.\n"
+        "# Программа сама узнаёт камеру по картинке и подставляет её разметку.\n"
         "# Ссылка — index.m3u8 из вкладки Network в «Аргусе», RTSP камеры или путь к видеофайлу.\n"
-        "# Ссылки из «Аргуса» живут около суток: каждый день обновляй только этот файл.\n"
-        "CAM-01 https://example/CAM-01/index.m3u8\n"
-        "CAM-02 rtsp://user:pass@10.0.0.12/stream1\n", encoding="utf-8")
+        "# Можно не копировать по одной: в Network нажмите правой кнопкой -> «Save all as HAR»\n"
+        "# и положите .har-файл в папку программы — ссылки возьмутся из него.\n", encoding="utf-8")
 
 
 def global_params(cam_dir=CAM_DIR):
@@ -68,15 +107,22 @@ def make_params(*dicts):
     return Params(**{k: v for k, v in merged.items() if k in Params.__dataclass_fields__})
 
 
-def load_cameras(cam_dir=CAM_DIR, links_path=LINKS):
-    """Конфиги всех размеченных камер; ссылки из links.txt заменяют старые."""
-    links = read_links(links_path)
-    cams = []
+def all_cameras(cam_dir=CAM_DIR):
+    """{камера: конфиг} всех размеченных камер."""
+    out = {}
     for f in sorted(Path(cam_dir).glob("*.json")):
         if f.name == "params.json":
             continue
         cfg = json.loads(f.read_text(encoding="utf-8"))
-        name = cfg.get("camera", f.stem)
+        out[cfg.get("camera", f.stem)] = cfg
+    return out
+
+
+def load_cameras(cam_dir=CAM_DIR, links_path=LINKS):
+    """Конфиги размеченных камер (с проёмами). Старый формат links.txt «ИМЯ ссылка» заменяет ссылку."""
+    links = read_links(links_path)
+    cams = []
+    for name, cfg in all_cameras(cam_dir).items():
         if name in links:
             cfg["source"] = links[name]
         if cfg.get("gates"):
@@ -84,11 +130,124 @@ def load_cameras(cam_dir=CAM_DIR, links_path=LINKS):
     return cams
 
 
-def save_camera(cfg, cam_dir=CAM_DIR):
+def ref_image(name, cam_dir=CAM_DIR):
+    """Образец вида камеры: снимок при разметке (или картинка авторазметки у старых камер)."""
+    import cv2
+    for suffix in ("_ref.jpg", "_auto.jpg"):
+        p = Path(cam_dir) / f"{name}{suffix}"
+        if p.exists():
+            img = cv2.imdecode(np.fromfile(str(p), np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                return img
+    return None
+
+
+def save_camera(cfg, cam_dir=CAM_DIR, frame=None):
+    import cv2
     Path(cam_dir).mkdir(exist_ok=True)
     path = Path(cam_dir) / f"{cfg['camera']}.json"
     path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    if frame is not None:                                # образец вида — по нему камера узнаётся завтра
+        ok, buf = cv2.imencode(".jpg", frame)
+        if ok:
+            (Path(cam_dir) / f"{cfg['camera']}_ref.jpg").write_bytes(buf.tobytes())
     return path
+
+
+def next_name(taken):
+    i = 1
+    while f"CAM-{i:02d}" in taken:
+        i += 1
+    return f"CAM-{i:02d}"
+
+
+def resolve_links(pairs, cam_dir=CAM_DIR, show=False, timeout=20.0):
+    """
+    Какая ссылка какой камере. pairs: [(подсказка-имя или None, ссылка)].
+    Возвращает (конфиги размеченных камер с сегодняшними ссылками, {новое имя: ссылка}, отчёт).
+    """
+    from camid import grab_many, match_cameras, url_key
+    cams = all_cameras(cam_dir)
+    urls = [u for _, u in pairs]
+    print(f"Проверяю {len(urls)} ссылок (беру по кадру с каждой)...")
+    frames = grab_many(urls, timeout)
+    refs = {n: img for n in cams if (img := ref_image(n, cam_dir)) is not None}
+    keys = {n: c.get("source_key") for n, c in cams.items()}
+    report = match_cameras(frames, refs, keys)
+    hints = {u: h for h, u in pairs if h}
+    taken = {r["camera"] for r in report if r["camera"]}
+    for r in report:                                     # старые камеры без образца — по имени из links.txt
+        h = hints.get(r["url"])
+        if r["camera"] is None and r["why"] == "новая камера" and h in cams and h not in refs and h not in taken:
+            r.update(camera=h, score=0, check=True, why="по имени (нет образца вида)")
+            taken.add(h)
+    today, new = [], {}
+    for r in report:
+        if r["camera"]:
+            cfg = cams[r["camera"]]
+            cfg["source"], cfg["source_key"] = r["url"], url_key(r["url"])
+            save_camera(cfg, cam_dir, frames[r["url"]] if r["camera"] not in refs else None)
+            if cfg.get("gates"):
+                today.append(cfg)
+        elif r["why"] == "новая камера":
+            name = hints.get(r["url"]) if hints.get(r["url"]) not in cams else None
+            name = name if name and name not in new else next_name(set(cams) | set(new))
+            new[name] = r["url"]
+            r["camera_new"] = name
+    _print_report(report, cams)
+    if show:
+        _show_report(report, frames, refs, cam_dir)
+    return today, new, report
+
+
+def _print_report(report, cams):
+    print()
+    for i, r in enumerate(report, 1):
+        short = r["url"] if len(r["url"]) < 60 else r["url"][:40] + "..." + r["url"][-15:]
+        if r["camera"]:
+            mark = "  ПРОВЕРЬТЕ" if r["check"] else ""
+            print(f"  {i:2}. {short} -> {r['camera']} ({r['why']}, сходство {r['score']}){mark}")
+        elif r.get("camera_new"):
+            print(f"  {i:2}. {short} -> новая камера, будет {r['camera_new']}")
+        else:
+            print(f"  {i:2}. {short} -> {r['why']}")
+    missing = sorted(set(cams) - {r["camera"] for r in report if r["camera"]})
+    if missing:
+        print("  Сегодня нет ссылки для:", ", ".join(missing))
+
+
+def _show_report(report, frames, refs, cam_dir):
+    """Картинка «образец | сейчас» по каждой узнанной камере — глазами проверить, что всё сошлось."""
+    import cv2
+    from hud import Painter
+    p = Painter(ru=True)
+    rows = []
+    for r in report:
+        if not r["camera"] or frames.get(r["url"]) is None:
+            continue
+        ref = refs.get(r["camera"])
+        cur = cv2.resize(frames[r["url"]], (320, 180))
+        left = cv2.resize(ref, (320, 180)) if ref is not None else np.zeros_like(cur)
+        row = np.hstack([left, cur])
+        color = (0, 165, 255) if r["check"] else (0, 200, 0)
+        cv2.rectangle(row, (0, 0), (639, 179), color, 3)
+        p.text(row, f"{r['camera']}: образец | сейчас  {'ПРОВЕРЬТЕ' if r['check'] else 'ок'}", (8, 22), 0.5,
+               (255, 255, 255), bg=(0, 0, 0))
+        rows.append(row)
+    if not rows:
+        return
+    cols = 2 if len(rows) > 4 else 1
+    while len(rows) % cols:
+        rows.append(np.zeros_like(rows[0]))
+    sheet = np.vstack([np.hstack(rows[i:i + cols]) for i in range(0, len(rows), cols)])
+    cv2.imwrite(str(Path(cam_dir) / "_links_check.jpg"), sheet)
+    win = "Links check"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.imshow(win, sheet)
+    print("\nПроверьте картинку: слева — как камера выглядела при разметке, справа — что пришло по ссылке.\n"
+          "Нажмите любую клавишу в окне, чтобы продолжить.")
+    cv2.waitKey(0)
+    cv2.destroyWindow(win)
 
 
 # ============================ ИСТОЧНИКИ КАДРОВ ============================
@@ -315,7 +474,7 @@ def observe(sources, seconds, params, model, show=False):
             print(f"{name}: нет ссылки или файла — пропускаю")
             continue
         st[name] = {"reader": r, "finder": None, "tracks": TrackCollector(), "tracker": SimpleTracker(),
-                    "frame": None, "last": 0.0}
+                    "frame": None, "last": 0.0, "bg": [], "n": 0}
     start = last_print = time.time()
     while st and time.time() - start < seconds:
         batch = []
@@ -333,6 +492,9 @@ def observe(sources, seconds, params, model, show=False):
                 s["finder"] = IndicatorFinder(frame.shape, params)
             s["finder"].add(frame)
             s["frame"] = frame
+            s["n"] += 1
+            if s["n"] % 15 == 1 and len(s["bg"]) < 15:      # кадры для образца вида без людей
+                s["bg"].append(frame)
             batch.append((name, frame, t))
         if all(s["reader"].done for s in st.values()):
             break
@@ -355,7 +517,8 @@ def observe(sources, seconds, params, model, show=False):
             cv2.waitKey(1)
     for s in st.values():
         s["reader"].close()
-    return {n: (s["frame"], s["finder"].find() if s["finder"] else [], s["tracks"].moving())
+    from camid import background
+    return {n: (background(s["bg"] + [s["frame"]]), s["finder"].find() if s["finder"] else [], s["tracks"].moving())
             for n, s in st.items() if s["frame"] is not None}
 
 
@@ -385,7 +548,7 @@ def autosetup(sources, seconds=180, params=None, model=None, review=True, cam_di
             k = cv2.waitKey(0) & 0xFF
             choice = {13: "y", 10: "y", ord("m"): "m", ord("s"): "s"}.get(k, "y")
         if choice == "y" and cfg["gates"]:
-            saved.append(save_camera(cfg, cam_dir))
+            saved.append(save_camera(cfg, cam_dir, frame))
         elif choice == "m" and review:
             cv2.destroyWindow("autosetup")
             if setup_mode(str(Path(cam_dir) / f"{name}.json"), sources[name], camera=name):
@@ -419,54 +582,82 @@ def _open_file(path):
         pass
 
 
+def _read_pasted():
+    """Многострочная вставка в консоль: до пустой строки."""
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def wizard(observe_sec=180, cam_dir=CAM_DIR, links_path=LINKS):
-    """Запуск без параметров: ссылки -> авторазметка новых камер -> мозаика всех камер."""
+    """Запуск без параметров: ссылки (в любом порядке) -> узнать камеры -> разметить новые -> мозаика."""
+    from datetime import date
     print("=== Детектор нарушений прохода (все камеры) ===\n")
     links_path, cam_dir = Path(links_path), Path(cam_dir)
-    if not links_path.exists():
-        print("Файла links.txt со ссылками на камеры ещё нет.")
-        link = _ask("Вставь ссылку на одну камеру (или Enter — создать links.txt для многих камер): ")
-        if link:
-            links_path.write_text(f"CAM-01 {link}\n", encoding="utf-8")
-        else:
-            write_links_template(links_path)
-            _open_file(links_path)
-            print(f"\nСоздан {links_path.resolve()}. Впиши туда камеры (по строке: НАЗВАНИЕ ССЫЛКА), "
-                  "сохрани и запусти программу снова.")
-            return
-    links = read_links(links_path)
-    if not links:
+    cam_dir.mkdir(exist_ok=True)
+    have = collect_links(links_path)
+    print("Вставьте ссылки на камеры — можно все сразу, в любом порядке, хоть с лишним текстом.\n"
+          "Закончите пустой строкой (нажмите Enter ещё раз).")
+    if have:
+        print(f"Или сразу Enter — взять сохранённые ({len(have)} шт. из links.txt / HAR-файлов).")
+    pasted = _read_pasted()
+    if pasted.strip():
+        pairs = parse_links(pasted)
+        if not pairs:
+            sys.exit("Во вставленном тексте не нашлось ни одной ссылки")
+        links_path.write_text(f"# ссылки на {date.today():%d.%m.%Y}\n" + "\n".join(u for _, u in pairs) + "\n",
+                              encoding="utf-8")
+    else:
+        pairs = have
+    if not pairs:
+        write_links_template(links_path)
         _open_file(links_path)
-        sys.exit(f"В {links_path} нет ни одной камеры. Формат строки: CAM-01 https://.../index.m3u8")
+        sys.exit(f"Ссылок нет. Вставьте их в окно при запуске или в {links_path.resolve()}")
 
     gp_path = cam_dir / "params.json"
-    cam_dir.mkdir(exist_ok=True)
     if not gp_path.exists():
         ru = _ask("Подписи на экране по-русски? (y — да, Enter — латиница): ").lower() in ("y", "д", "да", "yes")
         gp_path.write_text(json.dumps({"ru_text": ru, "cam_fps": 8}, ensure_ascii=False, indent=2), encoding="utf-8")
     params = make_params(global_params(cam_dir))
 
-    done = {c.get("camera") for c in load_cameras(cam_dir, links_path)}
-    new = {n: s for n, s in links.items() if n not in done}
-    print(f"Камер в links.txt: {len(links)}, размечено: {len(done & set(links))}, новых: {len(new)}")
-    choice = _ask("Enter — старт, a — переразметить ВСЕ камеры автоматически: ").lower()
+    today, new, _ = resolve_links(pairs, cam_dir, show=_gui_available())
+    print(f"\nУзнано размеченных камер: {len(today)}, новых: {len(new)}")
+    choice = _ask("Enter — старт, a — переразметить ВСЕ сегодняшние камеры автоматически: ").lower()
     if choice == "a":
-        new = dict(links)
+        new.update({c["camera"]: c["source"] for c in today})
     if new:
         how = _ask(f"Разметка {len(new)} камер: Enter — автоматически (~{observe_sec // 60} мин), "
-                   "m — вручную кликами: ").lower()
+                   "m — вручную (3 клика на проём): ").lower()
         if how == "m":
-            for n, s in new.items():
+            for n, src in new.items():
                 print(f"\n--- {n} ---")
-                setup_mode(str(cam_dir / f"{n}.json"), s, camera=n)
+                setup_mode(str(cam_dir / f"{n}.json"), src, camera=n)
         else:
             mins = _ask(f"Сколько минут наблюдать? Нужно хотя бы 3 прохода через каждый проём "
                         f"(Enter — {observe_sec // 60}): ")
             if mins.replace(",", ".").replace(".", "", 1).isdigit():
                 observe_sec = int(float(mins.replace(",", ".")) * 60)
             autosetup(new, observe_sec, params, review=True, cam_dir=cam_dir)
-    cfgs = [c for c in load_cameras(cam_dir, links_path) if c.get("camera") in links]
-    if not cfgs:
+        marked = all_cameras(cam_dir)
+        today = [c for c in today if c["camera"] not in new]
+        today += [marked[n] for n in new if n in marked and marked[n].get("gates")]
+    if not today:
         sys.exit("Нет ни одной размеченной камеры")
     print("\nОткрываю окно. Клик по камере — крупно, Esc — назад к мозаике, f — весь экран, q — выход.")
-    run_many(cfgs, global_params(cam_dir), show=True)
+    run_many(today, global_params(cam_dir), show=True)
+
+
+def _gui_available():
+    """Можно ли открывать окна (в серверной сборке OpenCV без экрана — нельзя)."""
+    import cv2
+    for line in cv2.getBuildInformation().splitlines():
+        if line.strip().startswith("GUI:"):
+            return "NONE" not in line.upper()
+    return True
