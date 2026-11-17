@@ -1,0 +1,93 @@
+"""Сквозной тест: синтетическое видео -> индикатор -> логика -> CSV. Нейросеть заменена заглушкой."""
+import csv
+import sys
+import types
+
+import pytest
+
+cv2 = pytest.importorskip("cv2")
+np = pytest.importorskip("numpy")
+
+import turnstile_detector as td  # noqa: E402
+
+FPS, N = 10, 80
+GREEN_FRAMES = range(5, 9)          # зелёный 0.5–0.8 с
+
+
+def person_x(tid, k):
+    """Человек 1 идёт с 1.0 с, человек 2 — с 2.0 с (зелёный был один -> второй нарушитель)."""
+    t0 = {1: 1.0, 2: 2.0}[tid]
+    t = k / FPS
+    return None if t < t0 else 40 + (t - t0) * 40
+
+
+class FakeYOLO:
+    def __init__(self, *_):
+        self.k = 0
+
+    def track(self, frame, **_):
+        boxes, ids = [], []
+        for tid in (1, 2):
+            x = person_x(tid, self.k)
+            if x is not None:
+                boxes.append([x - 15, 60, x + 15, 140])
+                ids.append(tid)
+        self.k += 1
+
+        res = types.SimpleNamespace(boxes=_Boxes(_T(boxes), _T(ids) if ids else None), keypoints=None)
+        return [res]
+
+
+class _T(list):
+    """Имитация тензора ultralytics: .tolist() и .int()."""
+    def tolist(self):
+        return list(self)
+
+    def int(self):
+        return self
+
+
+class _Boxes:
+    def __init__(self, xyxy, ids):
+        self.xyxy, self.id = xyxy, ids
+
+    def __len__(self):
+        return len(self.xyxy)
+
+
+@pytest.fixture
+def video(tmp_path):
+    path = tmp_path / "v.avi"
+    w = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (240, 200))
+    for k in range(N):
+        img = np.full((200, 240, 3), 128, np.uint8)
+        color = (0, 200, 0) if k in GREEN_FRAMES else (0, 0, 200)      # BGR: зелёный / красный
+        cv2.rectangle(img, (93, 38), (107, 52), color, 3)
+        w.write(img)
+    w.release()
+    return path
+
+
+def test_pipeline(tmp_path, video, monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "ultralytics", types.SimpleNamespace(YOLO=FakeYOLO))
+    monkeypatch.chdir(tmp_path)
+    cfg = {"camera": "TEST", "source": str(video), "anchor": "center",
+           "gates": [dict(td.SELFTEST_CFG, name="A")]}
+    td.run(cfg, td.Params(), show=False)
+
+    with open(tmp_path / "out/TEST/passes.csv", encoding="utf-8-sig") as f:
+        passes = list(csv.DictReader(f, delimiter=";"))
+    with open(tmp_path / "out/TEST/violations.csv", encoding="utf-8-sig") as f:
+        vio = list(csv.DictReader(f, delimiter=";"))
+    assert [p["был зелёный"] for p in passes] == ["да", "нет"]
+    assert [v["тип"] for v in vio] == ["NO_GREEN"]
+    assert (tmp_path / "out/TEST" / vio[0]["кадр"]).exists()
+    assert "NO_GREEN — 1" in capsys.readouterr().out
+
+
+def test_green_share_detects_colors():
+    img = np.full((20, 20, 3), 128, np.uint8)
+    cv2.rectangle(img, (2, 2), (17, 17), (0, 200, 0), 2)
+    assert td.green_share(img, (0, 0, 20, 20), td.Params()) > 0.9
+    cv2.rectangle(img, (2, 2), (17, 17), (0, 0, 200), 2)
+    assert td.green_share(img, (0, 0, 20, 20), td.Params()) < 0.1

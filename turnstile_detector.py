@@ -1,25 +1,36 @@
 """
-turnstile_detector_v3.py — детекция нарушений прохода через турникет по видео.
+turnstile_detector.py (v4) — детекция нарушений прохода через турникет по видео.
 
 Что ловит (на каждом проёме турникета отдельно):
   NO_GREEN  — человек прошёл линию проёма без зелёного сигнала (вдвоём по одному пропуску / без пропуска)
   ZONE      — в проёме одновременно больше людей, чем было зелёных сигналов
   WIDE      — подозрение: в одной рамке двое (рамка заметно шире обычной для этого проёма)
   HANDOVER  — возможная передача пропуска: руки двух людей по разные стороны турникета сошлись
-  LIMIT     — один человек дал больше MAX_PER_CARD зелёных подряд (лимит: владелец + 3)
+  LIMIT     — один человек дал больше max_per_card зелёных подряд (лимит: владелец + 3)
+  CLIMB     — перелаз через тумбу/ограждение (если в конфиге размечены "barriers")
   REVERSE   — проход в запрещённую сторону (только если в конфиге one_way = true)
 
+Что нового в v4 по сравнению с v3:
+  * проход не теряется, если трекер сменил id человека прямо на линии или потерял его
+    на долю секунды (пролаз под триподом, перекрытие) — треки «сшиваются» через линию;
+  * тревоги о проходах (NO_GREEN, WIDE, CLIMB, REVERSE) больше не глушат друг друга:
+    у каждого типа своя пауза, а записи одного события объединяются номером инцидента;
+  * зелёный засчитывается, только если горит green_frames кадров подряд (блики не дают разрешений);
+  * перелаз через тумбы (CLIMB) — отрезки "barriers" в конфиге, размечаются в --setup;
+  * для видеофайла можно обрабатывать не все кадры (process_fps) — анализ в разы быстрее;
+  * исправлена утечка памяти (словарь учтённых проходов рос без ограничения).
+
 Грузовые ворота размечаются как отдельный проём (тип "cargo"): логика та же, зелёный = один человек.
-Пока НЕ ловит: красный пропуск (нужен цвет карты), перелаз через тумбу турникета.
+Красный пропуск по видео не отличить: для него — сверка с выгрузкой СКУД (skud_check.py).
 
 Установка:
-    pip install ultralytics opencv-python lap numpy
+    pip install -r requirements.txt
 
 Порядок работы:
-    python turnstile_detector_v3.py --selftest                       # проверка логики, камера не нужна
-    python turnstile_detector_v3.py --setup --config cam.json --source "ССЫЛКА"
-    python turnstile_detector_v3.py --calib --config cam.json        # проверить индикатор
-    python turnstile_detector_v3.py --config cam.json                # работа
+    python turnstile_detector.py --selftest                       # проверка логики, камера не нужна
+    python turnstile_detector.py --setup --config cam.json --source "ССЫЛКА"
+    python turnstile_detector.py --calib --config cam.json        # проверить индикатор
+    python turnstile_detector.py --config cam.json                # работа
   Ссылка на поток может меняться: её можно каждый раз передавать через --source.
   Вместо ссылки можно указать видеофайл — тогда время берётся из самого видео.
 
@@ -33,8 +44,8 @@ import statistics
 import sys
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field, asdict
+from collections import Counter, deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -46,8 +57,13 @@ class Params:
     credit_ttl: float = 8.0        # сколько секунд после зелёного можно пройти
     green_window: float = 10.0     # окно, в котором зелёные учитываются для правила ZONE
     green_min_gap: float = 1.0     # защита от двойного срабатывания одного сигнала
+    green_frames: int = 2          # сколько кадров подряд должен гореть зелёный (защита от бликов)
     recross_sec: float = 5.0       # через сколько секунд тот же человек может быть посчитан снова
     one_way: bool = False          # True — проход против allowed_direction считается нарушением
+    # --- сшивание треков через линию ---
+    relink_sec: float = 1.5        # сколько секунд ждать «потерянного» человека на другой стороне
+    relink_dist: float = 1.2       # насколько далеко (в ширинах проёма) от места потери он может появиться
+    track_forget: float = 5.0      # через сколько секунд забыть невидимый трек
     # --- лимит сопровождения ---
     session_sec: float = 60.0
     max_per_card: int = 4          # владелец + 3
@@ -66,11 +82,18 @@ class Params:
     min_colored: int = 4
     green_frac: float = 0.5
     # --- прочее ---
-    cooldown: float = 4.0          # пауза между тревогами одного проёма
+    cooldown: float = 4.0          # пауза между тревогами ОДНОГО ТИПА на одном проёме (ZONE, HANDOVER, LIMIT)
+    incident_sec: float = 4.0      # тревоги одного проёма ближе этого — один инцидент
     model: str = "yolov8n-pose.pt"
     conf: float = 0.4
     kp_conf: float = 0.4           # минимальная уверенность точки кисти
     imgsz: int = 640
+    process_fps: float = 0.0       # видеофайл: сколько кадров в секунду анализировать (0 — все)
+
+
+# Тревоги, которые относятся к конкретному проходу конкретного человека: каждая пишется,
+# повторы того же человека отсекает recross_sec. Остальные — «состояния», для них действует cooldown.
+PASS_KINDS = {"NO_GREEN", "WIDE", "CLIMB", "REVERSE"}
 
 
 # ============================ ГЕОМЕТРИЯ ============================
@@ -129,8 +152,9 @@ class GateLogic:
         self.name = cfg.get("name", "A")
         self.zone = [tuple(p) for p in cfg["zone"]]
         self.a, self.b = tuple(cfg["line"][0]), tuple(cfg["line"][1])
-        self.roi = tuple(cfg["indicator"])
+        self.roi = tuple(int(v) for v in cfg["indicator"])
         self.allowed = cfg.get("allowed_direction", 1)
+        self.barriers = [(tuple(s[0]), tuple(s[1])) for s in cfg.get("barriers", [])]
         self.p = params
         self.kind = cfg.get("kind", "turnstile")           # "turnstile" или "cargo" (грузовые ворота)
         # масштаб = ширина обычного проёма в пикселях; у широких ворот задаётся отдельно полем "scale"
@@ -139,73 +163,130 @@ class GateLogic:
 
         self.credits = deque()
         self.recent_greens = deque()
-        self.was_green = False
+        self.g_run = self.r_run = 0
+        self.armed = True             # готов принять новый зелёный (после того как индикатор погас)
         self.last_green_t = -1e9
-        self.last_pos = {}        # tid -> (anchor, t)
-        self.counted = {}         # tid -> t последнего учтённого прохода
-        self.sessions = {}        # tid -> deque времён зелёных
+        self.last_pos = {}            # tid -> (anchor, t)
+        self.counted = {}             # tid -> t последнего учтённого прохода
+        self.climbed = {}             # tid -> t последнего перелаза
+        self.sessions = {}            # tid -> deque времён зелёных
         self.widths = deque(maxlen=200)
         self.zone_since = None
         self.hand_since = None
-        self.last_alert_t = -1e9
-        self.last_hand_t = -1e9
+        self.last_kind_t = {}         # тип тревоги -> t последней
+        self.incident = 0
+        self.last_violation_t = -1e9
+        self.stats = Counter()
 
     # -- служебное --
-    def _alert(self, events, t, kind, text, people=None, greens=None, own_cooldown=False):
-        if own_cooldown:
-            if t - self.last_hand_t < self.p.cooldown * 1.5:
+    def _alert(self, events, t, kind, text, people=None, greens=None):
+        if kind not in PASS_KINDS:
+            if t - self.last_kind_t.get(kind, -1e9) < self.p.cooldown:
                 return
-            self.last_hand_t = t
-        else:
-            if t - self.last_alert_t < self.p.cooldown:
-                return
-            self.last_alert_t = t
+        self.last_kind_t[kind] = t
+        if t - self.last_violation_t > self.p.incident_sec:
+            self.incident += 1
+        self.last_violation_t = t
+        self.stats[kind] += 1
         events.append({"type": "violation", "kind": kind, "text": text, "gate": self.name,
-                       "people": people, "greens": greens})
+                       "people": people, "greens": greens, "incident": f"{self.name}-{self.incident}"})
 
     def typical_width(self):
         if len(self.widths) >= self.p.min_width_samples:
             return statistics.median(self.widths)
         return None
 
+    def _near_line(self, pt, k=1.0):
+        return dist_point_seg(pt, self.a, self.b) <= k * self.L
+
+    def _relink(self, x, t, visible):
+        """Новый трек у линии: ищем недавно потерянный трек на другой стороне — это тот же человек."""
+        p = self.p
+        if not (point_in_poly(x.anchor, self.zone) or self._near_line(x.anchor)):
+            return None
+        s_new = side(x.anchor, self.a, self.b)
+        best = None
+        for tid, (pos, ts) in self.last_pos.items():
+            if tid in visible or tid == x.tid or t - ts > p.relink_sec or t - ts <= 0:
+                continue
+            if side(pos, self.a, self.b) in (0, s_new) or not self._near_line(pos, p.relink_dist):
+                continue
+            d = dist(pos, x.anchor)
+            if d <= 2 * p.relink_dist * self.L and (best is None or d < best[0]):
+                best = (d, tid, pos)
+        if best is None:
+            return None
+        _, old, pos = best
+        self.last_pos.pop(old, None)
+        if old in self.counted:                       # уже учтённый проход переносится на новый id
+            self.counted[x.tid] = self.counted.pop(old)
+        return pos
+
+    def _register_green(self, t, persons, ev):
+        p = self.p
+        self.last_green_t = t
+        self.credits.append(t)
+        self.recent_greens.append(t)
+        near = [(dist(x.anchor, self.ind_center), x) for x in persons if x.tid >= 0]
+        near = [(d, x) for d, x in near if d <= p.swiper_max_dist * self.L]
+        if not near:
+            return
+        swiper = min(near, key=lambda z: z[0])[1].tid
+        s = self.sessions.setdefault(swiper, deque())
+        s.append(t)
+        while s and t - s[0] > p.session_sec:
+            s.popleft()
+        if len(s) > p.max_per_card:
+            self._alert(ev, t, "LIMIT", f"Больше {p.max_per_card} проходов подряд по одному пропуску",
+                        greens=len(s))
+
     # -- основной шаг --
     def update(self, t, persons, is_green):
         p, ev = self.p, []
 
-        # 1. Зелёный сигнал: +1 разрешение
-        if is_green and not self.was_green and t - self.last_green_t >= p.green_min_gap:
-            self.last_green_t = t
-            self.credits.append(t)
-            self.recent_greens.append(t)
-            near = [(dist(x.anchor, self.ind_center), x) for x in persons if x.tid >= 0]
-            near = [(d, x) for d, x in near if d <= p.swiper_max_dist * self.L]
-            if near:
-                swiper = min(near, key=lambda z: z[0])[1].tid
-                s = self.sessions.setdefault(swiper, deque())
-                s.append(t)
-                while s and t - s[0] > p.session_sec:
-                    s.popleft()
-                if len(s) > p.max_per_card:
-                    self._alert(ev, t, "LIMIT",
-                                f"Больше {p.max_per_card} проходов подряд по одному пропуску",
-                                greens=len(s), own_cooldown=True)
-        self.was_green = is_green
+        # 1. Зелёный сигнал (с защитой от бликов): +1 разрешение
+        if is_green:
+            self.g_run, self.r_run = self.g_run + 1, 0
+        else:
+            self.g_run, self.r_run = 0, self.r_run + 1
+        if self.armed and self.g_run >= p.green_frames:
+            self.armed = False
+            if t - self.last_green_t >= p.green_min_gap:
+                self._register_green(t, persons, ev)
+        if not self.armed and self.r_run >= p.green_frames:
+            self.armed = True
 
         while self.credits and t - self.credits[0] > p.credit_ttl:
             self.credits.popleft()
         while self.recent_greens and t - self.recent_greens[0] > p.green_window:
             self.recent_greens.popleft()
 
-        # 2. Пересечение линии проёма
+        # 2. Пересечение линии проёма и ограждений
+        visible = {x.tid for x in persons if x.tid >= 0}
         for x in persons:
             if x.tid < 0:
                 continue
             prev = self.last_pos.get(x.tid)
+            if prev is None:
+                pos = self._relink(x, t, visible)
+                if pos is not None:
+                    prev = (pos, t)
             if side(x.anchor, self.a, self.b) == 0 and prev is not None:
                 self.last_pos[x.tid] = (prev[0], t)     # точка ровно на линии: ждём следующего кадра
                 continue
             self.last_pos[x.tid] = (x.anchor, t)
-            if prev is None or not seg_intersect(prev[0], x.anchor, self.a, self.b):
+            if prev is None:
+                continue
+
+            # перелаз через тумбу: опорная точка пересекла ограждение, а не проём
+            if any(seg_intersect(prev[0], x.anchor, a, b) for a, b in self.barriers) \
+                    and not seg_intersect(prev[0], x.anchor, self.a, self.b):
+                if t - self.climbed.get(x.tid, -1e9) >= p.recross_sec:
+                    self.climbed[x.tid] = t
+                    self._alert(ev, t, "CLIMB", "Перелаз через тумбу или ограждение", people=1)
+                continue
+
+            if not seg_intersect(prev[0], x.anchor, self.a, self.b):
                 continue
             if t - self.counted.get(x.tid, -1e9) < p.recross_sec:
                 continue
@@ -236,9 +317,12 @@ class GateLogic:
             if not wide:
                 self.widths.append(width)
 
-        # забываем треки, которых давно не видно
-        for tid in [k for k, (_, ts) in self.last_pos.items() if t - ts > 5.0]:
+        # забываем старое, чтобы память не росла
+        for tid in [k for k, (_, ts) in self.last_pos.items() if t - ts > p.track_forget]:
             self.last_pos.pop(tid, None)
+        for d in (self.counted, self.climbed):
+            for tid in [k for k, ts in d.items() if t - ts > p.recross_sec]:
+                d.pop(tid, None)
         for tid in [k for k, d in self.sessions.items() if not d or t - d[-1] > p.session_sec]:
             self.sessions.pop(tid, None)
 
@@ -256,7 +340,19 @@ class GateLogic:
             self.zone_since = None
 
         # 4. Передача пропуска: кисти людей по разные стороны линии сошлись у турникета
-        hand = False
+        if self._hands_meet(persons):
+            if self.hand_since is None:
+                self.hand_since = t
+            elif t - self.hand_since >= p.hand_sec:
+                self._alert(ev, t, "HANDOVER", "Возможная передача пропуска через турникет", people=2)
+                self.hand_since = None
+        else:
+            self.hand_since = None
+
+        return ev
+
+    def _hands_meet(self, persons):
+        p = self.p
         for i in range(len(persons)):
             for j in range(i + 1, len(persons)):
                 A, B = persons[i], persons[j]
@@ -269,78 +365,89 @@ class GateLogic:
                             continue
                         mid = ((wa[0] + wb[0]) / 2, (wa[1] + wb[1]) / 2)
                         if dist_point_seg(mid, self.a, self.b) <= p.hand_line_dist * self.L:
-                            hand = True
-        if hand:
-            if self.hand_since is None:
-                self.hand_since = t
-            elif t - self.hand_since >= p.hand_sec:
-                self._alert(ev, t, "HANDOVER", "Возможная передача пропуска через турникет",
-                            people=2, own_cooldown=True)
-                self.hand_since = None
-        else:
-            self.hand_since = None
-
-        return ev
+                            return True
+        return False
 
 
 # ============================ САМОПРОВЕРКА ============================
+SELFTEST_CFG = {"name": "T", "zone": [[80, 60], [120, 60], [120, 140], [80, 140]],
+                "line": [[100, 60], [100, 140]], "indicator": [95, 40, 105, 50],
+                "barriers": [[[100, 140], [100, 200]]]}       # тумба ниже проёма
+
+
+def walker(tid, t0, t, y=100, speed=40, w=30, start=40):
+    x = start + (t - t0) * speed
+    return Person(tid, (x - w / 2, y - 40, x + w / 2, y + 40), (x, y))
+
+
+def simulate(scn, dur=8.0, fps=10, warm=True, params=None, cfg=None):
+    """Прогоняет сценарий scn(t) -> (persons, is_green) и возвращает список типов тревог."""
+    g = GateLogic(cfg or SELFTEST_CFG, params or Params())
+    if warm:
+        g.widths.extend([30] * 20)
+    out = []
+    for k in range(int(dur * fps)):
+        t = k / fps
+        persons, green = scn(t)
+        out += [e["kind"] for e in g.update(t, persons, green) if e["type"] == "violation"]
+    return out
+
+
+def selftest_cases():
+    def green(*spans):
+        return lambda t: any(a <= t < b for a, b in spans)
+
+    def two_walkers(t1, t2, g):
+        return lambda t: (([walker(1, t1, t)] if t >= t1 else []) + ([walker(2, t2, t)] if t >= t2 else []), g(t))
+
+    def lost_on_line(g):
+        # трекер теряет человека перед линией и выдаёт новый id уже за линией (пролаз, перекрытие)
+        def scn(t):
+            if 1.0 <= t < 2.3:
+                return [walker(1, 1.0, t)], g(t)          # x: 40 -> 92
+            if 2.8 <= t < 5.0:
+                return [walker(7, 1.0, t)], g(t)          # x: 112 -> ...
+            return [], g(t)
+        return scn
+
+    return [
+        ("1 зелёный, 1 человек", dict(scn=lambda t: ([walker(1, 1.0, t)] if t >= 1 else [], 0.5 <= t < 1.0)), []),
+        ("1 зелёный, 2 человека", dict(scn=two_walkers(1.0, 2.2, green((0.5, 1.0))), dur=6.0), ["NO_GREEN"]),
+        ("2 зелёных, 2 человека", dict(scn=two_walkers(1.0, 3.0, green((0.5, 0.8), (2.5, 2.8))), dur=6.0), []),
+        ("0 зелёных, 1 человек", dict(scn=lambda t: ([walker(1, 1.0, t)] if t >= 1 else [], False)), ["NO_GREEN"]),
+        ("1 зелёный, широкая рамка",
+         dict(scn=lambda t: ([walker(1, 1.0, t, w=60)] if t >= 1 else [], 0.5 <= t < 1.0)), ["WIDE"]),
+        ("двое в зоне на 1 зелёный", dict(scn=lambda t: (
+            [Person(-1, (75, 60, 105, 140), (90, 100)), Person(-1, (95, 60, 125, 140), (110, 100))]
+            if 1.0 <= t < 2.5 else [], 0.5 <= t < 1.0), dur=4.0), ["ZONE"]),
+        ("передача пропуска", dict(scn=lambda t: (
+            [Person(1, (50, 60, 80, 140), (65, 100), [(98, 55)]),
+             Person(2, (120, 60, 150, 140), (135, 100), [(104, 57)])] if 1.0 <= t < 2.5 else [], False),
+            dur=4.0), ["HANDOVER"]),
+        ("5 зелёных от одного", dict(scn=lambda t: ([Person(1, (60, 20, 90, 100), (95, 60))], (t % 2.0) < 0.3),
+                                     dur=11.0), ["LIMIT"]),
+        ("мимо проёма", dict(scn=lambda t: ([walker(1, 1.0, t, y=300)] if t >= 1 else [], False)), []),
+        # --- новое в v4 ---
+        ("потеря трека на линии, без зелёного", dict(scn=lost_on_line(green())), ["NO_GREEN"]),
+        ("потеря трека на линии, с зелёным", dict(scn=lost_on_line(green((0.5, 1.0)))), []),
+        ("блик индикатора в 1 кадр", dict(scn=lambda t: ([walker(1, 1.0, t)] if t >= 1 else [],
+                                                         abs(t - 0.5) < 0.05)), ["NO_GREEN"]),
+        ("двое без пропуска подряд", dict(scn=two_walkers(1.0, 2.0, green()), dur=6.0), ["NO_GREEN", "NO_GREEN"]),
+        ("перелаз через тумбу", dict(scn=lambda t: ([walker(1, 1.0, t, y=170)] if t >= 1 else [], False)), ["CLIMB"]),
+    ]
+
+
 def selftest():
-    cfg = {"name": "T", "zone": [[80, 60], [120, 60], [120, 140], [80, 140]],
-           "line": [[100, 60], [100, 140]], "indicator": [95, 40, 105, 50]}
-
-    def walker(tid, t0, t, y=100, speed=40, w=30, start=40):
-        x = start + (t - t0) * speed
-        return Person(tid, (x - w / 2, y - 40, x + w / 2, y + 40), (x, y))
-
-    def run(scn, dur=8.0, fps=10, warm=True):
-        g = GateLogic(cfg, Params())
-        if warm:
-            g.widths.extend([30] * 20)
-        out, n = [], int(dur * fps)
-        for k in range(n):
-            t = k / fps
-            persons, green = scn(t)
-            out += [e["kind"] for e in g.update(t, persons, green) if e["type"] == "violation"]
-        return out
-
-    tests = []
-    # 1. один зелёный, один человек -> чисто
-    tests.append(("1 зелёный, 1 человек", run(lambda t: ([walker(1, 1.0, t)] if t >= 1 else [], 0.5 <= t < 1.0)), []))
-    # 2. один зелёный, двое друг за другом -> NO_GREEN
-    tests.append(("1 зелёный, 2 человека", run(
-        lambda t: (([walker(1, 1.0, t)] if t >= 1 else []) + ([walker(2, 2.2, t)] if t >= 2.2 else []),
-                   0.5 <= t < 1.0), dur=6.0), ["NO_GREEN"]))
-    # 3. два зелёных, двое -> чисто
-    tests.append(("2 зелёных, 2 человека", run(
-        lambda t: (([walker(1, 1.0, t)] if t >= 1 else []) + ([walker(2, 3.0, t)] if t >= 3.0 else []),
-                   (0.5 <= t < 0.8) or (2.5 <= t < 2.8)), dur=6.0), []))
-    # 4. без зелёного -> NO_GREEN
-    tests.append(("0 зелёных, 1 человек", run(lambda t: ([walker(1, 1.0, t)] if t >= 1 else [], False)), ["NO_GREEN"]))
-    # 5. один зелёный, одна широкая рамка -> WIDE
-    tests.append(("1 зелёный, широкая рамка", run(
-        lambda t: ([walker(1, 1.0, t, w=60)] if t >= 1 else [], 0.5 <= t < 1.0)), ["WIDE"]))
-    # 6. двое стоят в проёме, один зелёный -> ZONE
-    tests.append(("двое в зоне на 1 зелёный", run(
-        lambda t: ([Person(-1, (75, 60, 105, 140), (90, 100)), Person(-1, (95, 60, 125, 140), (110, 100))]
-                   if 1.0 <= t < 2.5 else [], 0.5 <= t < 1.0), dur=4.0), ["ZONE"]))
-    # 7. руки сошлись через турникет -> HANDOVER
-    tests.append(("передача пропуска", run(
-        lambda t: ([Person(1, (50, 60, 80, 140), (65, 100), [(98, 55)]),
-                    Person(2, (120, 60, 150, 140), (135, 100), [(104, 57)])] if 1.0 <= t < 2.5 else [], False),
-        dur=4.0), ["HANDOVER"]))
-    # 8. пятый зелёный от одного человека -> LIMIT
-    tests.append(("5 зелёных от одного", run(
-        lambda t: ([Person(1, (60, 20, 90, 100), (95, 60))], (t % 2.0) < 0.3), dur=11.0), ["LIMIT"]))
-    # 9. человек идёт мимо проёма (линию как бесконечную прямую пересёк, отрезок — нет) -> чисто
-    tests.append(("мимо проёма", run(lambda t: ([walker(1, 1.0, t, y=300)] if t >= 1 else [], False)), []))
-
     ok = True
-    for name, got, want in tests:
+    for name, kw, want in selftest_cases():
+        got = simulate(**kw)
         good = got == want
         ok &= good
         print(("OK  " if good else "FAIL"), name, "->", got, "" if good else f"(ожидалось {want})")
     print("\nЛогика в порядке." if ok else "\nЕсть ошибки в логике!")
     return ok
+
+
 # ============================ РАБОТА С ВИДЕО ============================
 def is_file_source(src):
     return isinstance(src, str) and not src.lower().startswith(("rtsp://", "http://", "https://")) and Path(src).exists()
@@ -418,6 +525,35 @@ def grab_frame(source):
     return frame
 
 
+def click_segments(frame, n, gate_pts, title):
+    """Разметка n отрезков (по 2 клика): верх тумбы / линия ограждения вдоль, по которой нельзя перелезать."""
+    import cv2
+    pts = []
+    if n <= 0:
+        return []
+
+    def on_click(event, x, y, *_):
+        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2 * n:
+            pts.append((x, y))
+
+    cv2.setMouseCallback("setup", on_click)
+    while len(pts) < 2 * n:
+        view = frame.copy()
+        for k in range(4):
+            cv2.line(view, gate_pts[k], gate_pts[(k + 1) % 4], (255, 200, 0), 1)
+        cv2.line(view, gate_pts[4], gate_pts[5], (0, 0, 255), 2)
+        for k in range(0, len(pts) - 1, 2):
+            cv2.line(view, pts[k], pts[k + 1], (255, 0, 255), 2)
+        for q in pts:
+            cv2.circle(view, q, 4, (255, 0, 255), -1)
+        cv2.putText(view, f"{title} {len(pts) // 2 + 1}/{n}: point {len(pts) % 2 + 1}/2", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.imshow("setup", view)
+        if cv2.waitKey(30) == 27:
+            sys.exit("Отменено")
+    return [[list(pts[k]), list(pts[k + 1])] for k in range(0, 2 * n, 2)]
+
+
 def setup_mode(config_path, source):
     import cv2
     if not source:
@@ -459,9 +595,12 @@ def setup_mode(config_path, source):
         (x1, y1), (x2, y2) = pts[6], pts[7]
         kind = "cargo" if (input(f"Проём {gi + 1}: 1 — обычный турникет, 2 — грузовые ворота [1]: ").strip()
                            or "1") == "2" else "turnstile"
+        n_bar = int(input(f"Проём {gi + 1}: сколько тумб/ограждений разметить для CLIMB (по 2 клика) [0]: ")
+                    .strip() or 0)
+        barriers = click_segments(frame0, n_bar, pts, f"gate {gi + 1}/{n_gates} barrier")
         gates.append({"name": chr(ord("A") + gi), "kind": kind, "zone": pts[:4], "line": pts[4:6],
                       "indicator": [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)],
-                      "allowed_direction": 1})
+                      "barriers": barriers, "allowed_direction": 1})
     cv2.destroyAllWindows()
     # масштаб для грузовых ворот: ширина обычного турникета в этом же кадре, иначе половина ширины ворот
     normal = [dist(g["line"][0], g["line"][1]) for g in gates if g["kind"] == "turnstile"]
@@ -522,8 +661,10 @@ class Output:
         if ok:
             (self.dir / fname).write_bytes(buf.tobytes())      # так работают и русские буквы в пути
         self._row("violations.csv",
-                  ["время", "камера", "проём", "тип", "описание", "людей", "зелёных", "кадр", "вердикт оператора"],
-                  [stamp, self.camera, e["gate"], e["kind"], e["text"], e["people"], e["greens"], fname, ""])
+                  ["время", "камера", "проём", "инцидент", "тип", "описание", "людей", "зелёных", "кадр",
+                   "вердикт оператора"],
+                  [stamp, self.camera, e["gate"], e["incident"], e["kind"], e["text"], e["people"], e["greens"],
+                   fname, ""])
         print(f"[!] {stamp} проём {e['gate']}: {e['text']} -> {fname}")
 
 
@@ -567,6 +708,7 @@ def run(cfg, params, show=True):
     if file_mode:
         cap = cv2.VideoCapture(source)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        step = max(1, round(fps / params.process_fps)) if params.process_fps > 0 else 1
         reader, frame_i = None, 0
     else:
         reader, last_n = LatestFrame(source), 0
@@ -575,6 +717,9 @@ def run(cfg, params, show=True):
     try:
         while True:
             if file_mode:
+                for _ in range(step - 1):                      # пропущенные кадры не отдаём в нейросеть
+                    cap.grab()
+                    frame_i += 1
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -610,6 +755,8 @@ def run(cfg, params, show=True):
                 for k in range(len(pts)):
                     cv2.line(view, pts[k], pts[(k + 1) % len(pts)], (255, 200, 0), 1)
                 cv2.line(view, tuple(map(int, g.a)), tuple(map(int, g.b)), (0, 0, 255), 2)
+                for a, b in g.barriers:
+                    cv2.line(view, tuple(map(int, a)), tuple(map(int, b)), (255, 0, 255), 2)
                 cv2.rectangle(view, g.roi[:2], g.roi[2:], (0, 255, 0) if is_green else (0, 0, 255), 2)
                 cv2.putText(view, f"{g.name}: credits {len(g.credits)}", (int(g.a[0]), int(g.a[1]) - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
@@ -632,8 +779,13 @@ def run(cfg, params, show=True):
     finally:
         if reader is not None:
             reader.stop = True
+        else:
+            cap.release()
         if show:
             cv2.destroyAllWindows()
+    total = sum((g.stats for g in gates), Counter())
+    if total:
+        print("Тревоги:", ", ".join(f"{k} — {v}" for k, v in total.most_common()))
     print("Остановлено. Результаты в папке", out.dir)
 
 
