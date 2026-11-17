@@ -4,3 +4,5 @@ out/
 *.pt
 cam.json
 .venv/
+links.txt
+cameras/

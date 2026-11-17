@@ -1,0 +1,239 @@
+"""
+autosetup.py — автоматическая разметка проёмов по наблюдению за видео.
+
+Вместо 8 кликов на проём программа несколько минут смотрит поток и находит сама:
+
+1. Индикаторы — места, где пиксели бывают то насыщенно-красными, то зелёными
+   (окантовка купола, ворота, галочка/крестик на считывателе пожарного выхода).
+   Если за время наблюдения никто не прикладывал пропуск, берутся устойчиво красные
+   небольшие пятна — такие проёмы помечаются «проверить».
+2. Проёмы — по траекториям людей рядом с каждым индикатором: главное направление
+   движения, «талия» потока (где люди идут теснее всего — это и есть проём),
+   ширина проёма. Линия проёма — поперёк потока в самом узком месте.
+3. Тип — маленький (турникет, трипод) или большой (грузовые ворота): ширина потока
+   сравнивается с шириной человека в этом же месте кадра. Поэтому одинаково работает и
+   для турникетов у камеры, и для дальних, и для широких ворот.
+
+Результат — обычный конфиг камеры (тот же формат, что после --setup) и картинка
+с разметкой для проверки. Разметку всегда стоит проверить глазами: в окне проверки
+Enter — принять, m — разметить вручную, s — пропустить камеру.
+"""
+
+import cv2
+import numpy as np
+
+from turnstile_detector import Params, dist
+
+GREEN_H, RED_LO, RED_HI = (35, 90), 12, 165
+
+
+# ============================ ИНДИКАТОРЫ ============================
+class IndicatorFinder:
+    """Копит по кадрам, какие пиксели бывали красными и какие зелёными."""
+
+    def __init__(self, shape, p: Params = None, down=2):
+        p = p or Params()
+        self.p, self.down = p, down
+        h, w = shape[0] // down, shape[1] // down
+        self.red = np.zeros((h, w), np.uint16)
+        self.green = np.zeros((h, w), np.uint16)
+        self.n = 0
+
+    def add(self, frame):
+        small = cv2.resize(frame, (self.red.shape[1], self.red.shape[0]), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        colored = (s >= max(self.p.sat_min, 90)) & (v >= max(self.p.val_min, 80))
+        self.green += (colored & (h >= GREEN_H[0]) & (h <= GREEN_H[1])).astype(np.uint16)
+        self.red += (colored & ((h <= RED_LO) | (h >= RED_HI))).astype(np.uint16)
+        self.n += 1
+
+    def find(self, min_hits=2, max_area_frac=0.01, red_share=0.4):
+        """Список {"box": [x1,y1,x2,y2], "toggled": bool} в координатах исходного кадра.
+
+        Индикатор стоит на месте и почти всё время красный, иногда зелёный. Одежда идущих людей
+        тоже бывает красной и зелёной, но в каждой точке недолго — поэтому нужна доля красного red_share.
+        """
+        if self.n == 0:
+            return []
+        toggled = (self.red >= red_share * self.n) & (self.green >= min_hits)
+        steady_red = self.red >= 0.8 * self.n
+        out = []
+        for mask, is_toggle in ((toggled, True), (steady_red & ~toggled, False)):
+            m = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2)
+            n, _, stats, _ = cv2.connectedComponentsWithStats(m)
+            max_area = max_area_frac * m.size
+            for i in range(1, n):
+                x, y, w, h, area = stats[i]
+                if area < 4 or area > max_area or w > 6 * h + 4 or h > 6 * w + 4:
+                    continue
+                pad = 1
+                box = [int((x - pad) * self.down), int((y - pad) * self.down),
+                       int((x + w + pad) * self.down), int((y + h + pad) * self.down)]
+                if not is_toggle and any(_near(box, o["box"]) for o in out):
+                    continue                                   # кусок уже найденного индикатора
+                out.append({"box": [max(0, b) for b in box], "toggled": is_toggle})
+        return out
+
+
+def _near(a, b):
+    """Рамки пересекаются или почти касаются (с запасом в свой размер)."""
+    m = max(b[2] - b[0], b[3] - b[1], a[2] - a[0], a[3] - a[1])
+    return not (a[2] + m < b[0] or b[2] + m < a[0] or a[3] + m < b[1] or b[3] + m < a[1])
+
+
+def box_dist(p, box):
+    """Расстояние от точки до рамки (0 — внутри)."""
+    dx = max(box[0] - p[0], 0, p[0] - box[2])
+    dy = max(box[1] - p[1], 0, p[1] - box[3])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _center(box):
+    return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+
+
+# ============================ ПРОЁМЫ ПО ТРАЕКТОРИЯМ ============================
+def split_tracks(tracks, indicators, max_dist):
+    """Каждую траекторию отдаём ближайшему индикатору. Расстояние меряется до рамки человека,
+    а не до ног: индикатор стоит на стойке на уровне пояса и при проходе оказывается «внутри» человека."""
+    groups = [[] for _ in indicators]
+    centers = [_center(i["box"]) for i in indicators]
+    for tr in tracks:
+        if len(tr["points"]) < 3:
+            continue
+        boxes = tr.get("boxes") or [(p[0], p[1], p[0], p[1]) for p in tr["points"]]
+        best = None
+        for gi, c in enumerate(centers):
+            d = min(box_dist(c, b) for b in boxes)
+            if d <= max_dist(gi) and (best is None or d < best[0]):
+                best = (d, gi)
+        if best:
+            groups[best[1]].append(tr)
+    return groups
+
+
+def gate_from_tracks(tracks, indicator, cargo_factor=2.2):
+    """Проём по траекториям, прошедшим у индикатора. None — если людей было слишком мало."""
+    pts = np.array([p for tr in tracks for p in tr["points"]], float)
+    widths = [w for tr in tracks for w in tr["widths"]]
+    if len(tracks) < 3 or len(pts) < 10 or not widths:
+        return None
+    person_w = float(np.median(widths))
+    # главное направление движения — по смещениям внутри траекторий
+    steps = np.concatenate([np.diff(np.array(tr["points"], float), axis=0) for tr in tracks if len(tr["points"]) > 1])
+    steps = steps[np.linalg.norm(steps, axis=1) > 1e-6]
+    if len(steps) < 5:
+        return None
+    _, _, vt = np.linalg.svd(steps, full_matrices=False)  # ось без знака: люди ходят в обе стороны
+    d = vt[0] / np.linalg.norm(vt[0])                     # вдоль потока
+    n = np.array([-d[1], d[0]])                           # поперёк потока
+    c0 = pts.mean(axis=0)
+    along, across = (pts - c0) @ d, (pts - c0) @ n
+    # «талия» потока: срез вдоль направления с наименьшим разбросом поперёк
+    lo, hi = np.percentile(along, 10), np.percentile(along, 90)
+    best = None
+    for s in np.linspace(lo, hi, 15):
+        sel = np.abs(along - s) <= max(person_w * 0.5, (hi - lo) / 15)
+        if sel.sum() < 6:
+            continue
+        spread = np.percentile(across[sel], 90) - np.percentile(across[sel], 10)
+        if best is None or spread < best[0]:
+            best = (spread, s, float(np.median(across[sel])))
+    if best is None:
+        return None
+    spread, s, mid = best
+    width = max(spread + person_w, 1.1 * person_w)        # проём шире разброса центров на ширину человека
+    center = c0 + d * s + n * mid
+    kind = "cargo" if width > cargo_factor * person_w else "turnstile"
+    a, b = center - n * width / 2, center + n * width / 2
+    depth = max(0.6 * width, 1.2 * person_w) if kind == "turnstile" else 1.2 * person_w
+    zone = [center - n * width / 2 - d * depth / 2, center + n * width / 2 - d * depth / 2,
+            center + n * width / 2 + d * depth / 2, center - n * width / 2 + d * depth / 2]
+    g = {"kind": kind, "line": [_ip(a), _ip(b)], "zone": [_ip(q) for q in zone],
+            "indicator": list(indicator["box"]),
+            "auto": {"passes": len(tracks), "person_w": round(person_w, 1), "width": round(width, 1),
+                     "indicator_seen_green": indicator["toggled"], "check": not indicator["toggled"]}}
+    if kind == "cargo":                                   # масштаб правил — ширина обычного турникета
+        g["scale"] = round(1.3 * person_w, 1)
+    return g
+
+
+def _ip(p):
+    return [int(round(p[0])), int(round(p[1]))]
+
+
+def build_config(camera, source, frame_shape, indicators, tracks, anchor="foot"):
+    """Собирает конфиг камеры. Возвращает (cfg, заметки для оператора)."""
+    notes = []
+    if not indicators:
+        notes.append("индикаторы не найдены — нужна ручная разметка или наблюдение подольше")
+        return {"camera": camera, "source": source, "anchor": anchor, "gates": [], "params": {}}, notes
+    widths = [w for tr in tracks for w in tr["widths"]] or [frame_shape[1] / 20]
+    pw = float(np.median(widths))
+    groups = split_tracks(tracks, indicators, lambda gi: 1.5 * pw)
+    gates = []
+    for ind, grp in zip(indicators, groups):
+        g = gate_from_tracks(grp, ind)
+        if g is None:
+            notes.append(f"индикатор {ind['box']}: мало проходов рядом ({len(grp)}), проём не построен")
+            continue
+        g["name"] = chr(ord("A") + len(gates))
+        g["allowed_direction"] = 1
+        g["barriers"] = []
+        if g["auto"]["check"]:
+            notes.append(f"проём {g['name']}: зелёный за время наблюдения не загорался — проверь индикатор")
+        gates.append(g)
+    cfg = {"camera": camera, "source": source, "anchor": anchor, "gates": gates, "params": {}}
+    return cfg, notes
+
+
+# ============================ НАБЛЮДЕНИЕ ============================
+class TrackCollector:
+    """Собирает траектории опорных точек людей (по id трекера)."""
+
+    def __init__(self, anchor="foot"):
+        self.anchor = anchor
+        self.tracks = {}
+
+    def add(self, boxes, ids):
+        for (x1, y1, x2, y2), tid in zip(boxes, ids):
+            if tid < 0:
+                continue
+            pt = ((x1 + x2) / 2, (y1 + y2) / 2) if self.anchor == "center" else ((x1 + x2) / 2, y2)
+            tr = self.tracks.setdefault(tid, {"points": [], "widths": [], "boxes": []})
+            tr["points"].append(pt)
+            tr["widths"].append(x2 - x1)
+            tr["boxes"].append((x1, y1, x2, y2))
+
+    def moving(self, min_path=None):
+        out = []
+        for tr in self.tracks.values():
+            p = tr["points"]
+            if len(p) < 3:
+                continue
+            path = dist(p[0], p[-1])
+            if path >= (min_path if min_path is not None else 1.0 * float(np.median(tr["widths"]))):
+                out.append(tr)
+        return out
+
+
+def draw_markup(frame, cfg, notes=()):
+    img = frame.copy()
+    for g in cfg["gates"]:
+        color = (0, 200, 255) if g.get("auto", {}).get("check") else (255, 200, 0)
+        pts = [tuple(q) for q in g["zone"]]
+        for k in range(len(pts)):
+            cv2.line(img, pts[k], pts[(k + 1) % len(pts)], color, 2)
+        cv2.line(img, tuple(g["line"][0]), tuple(g["line"][1]), (0, 0, 255), 3)
+        x1, y1, x2, y2 = g["indicator"]
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        lbl = f"{g['name']} {'BIG' if g['kind'] == 'cargo' else 'small'} ({g['auto']['passes']} passes)"
+        cv2.putText(img, lbl, (pts[0][0], max(15, pts[0][1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 2)
+    y = img.shape[0] - 10
+    for i, _ in enumerate(notes):
+        cv2.putText(img, f"note {i + 1}: see console", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        y -= 20
+    return img
+

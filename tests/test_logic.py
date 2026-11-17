@@ -97,3 +97,16 @@ def test_quick_start_updates_link(tmp_path, monkeypatch):
     td.quick_start(str(cfg_path))
     assert seen == {"src": "https://new/index.m3u8", "gf": 3}
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["source"] == "https://new/index.m3u8"
+
+
+def test_id_reused_by_tracker_still_counts():
+    # трекер отдал id ушедшего человека встречному: тот же tid снова пересекает линию через 3 с
+    def scn(t):
+        green = 0.5 <= t < 1.0
+        if 1.0 <= t < 4.0:
+            return [walker(1, 1.0, t, speed=70)], green                # 40 -> 250, ушёл от линии далеко
+        if 4.0 <= t < 7.0:
+            return [walker(1, 4.0, t, speed=-70, start=250)], green    # обратно через 4 с, без зелёного
+        return [], green
+    assert simulate(scn, dur=8.0) == ["NO_GREEN"]
+    assert simulate(scn, dur=8.0, params=Params(recross_dist=99)) == []   # поведение v3: проход терялся

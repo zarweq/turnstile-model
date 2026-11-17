@@ -59,6 +59,8 @@ class Params:
     green_min_gap: float = 1.0     # защита от двойного срабатывания одного сигнала
     green_frames: int = 2          # сколько кадров подряд должен гореть зелёный (защита от бликов)
     recross_sec: float = 5.0       # через сколько секунд тот же человек может быть посчитан снова
+    recross_dist: float = 1.5      # ...или раньше, если он успел отойти от линии дальше (в ширинах проёма):
+                                   # значит это уже другой проход (или трекер передал id другому человеку)
     one_way: bool = False          # True — проход против allowed_direction считается нарушением
     # --- сшивание треков через линию ---
     relink_sec: float = 1.5        # сколько секунд ждать «потерянного» человека на другой стороне
@@ -90,6 +92,9 @@ class Params:
     imgsz: int = 640
     process_fps: float = 0.0       # видеофайл: сколько кадров в секунду анализировать (0 — все)
     sound: bool = True             # звуковой сигнал при тревоге (Windows)
+    ru_text: bool = False          # подписи на экране по-русски (через Pillow)
+    device: str = ""               # "" — сам выберет видеокарту, "cpu" — процессор, "0" — первая видеокарта
+    cam_fps: float = 8.0           # много камер: сколько кадров/с анализировать с каждой камеры
 
 
 # Тревоги, которые относятся к конкретному проходу конкретного человека: каждая пишется,
@@ -276,6 +281,8 @@ class GateLogic:
                 self.last_pos[x.tid] = (prev[0], t)     # точка ровно на линии: ждём следующего кадра
                 continue
             self.last_pos[x.tid] = (x.anchor, t)
+            if x.tid in self.counted and dist_point_seg(x.anchor, self.a, self.b) > p.recross_dist * self.L:
+                self.counted.pop(x.tid)                    # ушёл от проёма — следующий проход считается заново
             if prev is None:
                 continue
 
@@ -555,12 +562,12 @@ def click_segments(frame, n, gate_pts, title):
     return [[list(pts[k]), list(pts[k + 1])] for k in range(0, 2 * n, 2)]
 
 
-def setup_mode(config_path, source):
+def setup_mode(config_path, source, camera=None):
     import cv2
     if not source:
         sys.exit("Для --setup укажи --source \"ссылка или файл\"")
     frame0 = grab_frame(source)
-    camera = input("Название камеры (например CAM-01): ").strip() or "camera"
+    camera = camera or input("Название камеры (например CAM-01): ").strip() or "camera"
     n_gates = int(input("Сколько проёмов турникета видно в кадре? [1]: ").strip() or 1)
     anchor = "center" if (input("Камера смотрит: 1 — сбоку, 2 — сверху [1]: ").strip() or "1") == "2" else "foot"
     steps = ["zone 1/4", "zone 2/4", "zone 3/4", "zone 4/4", "line 1/2", "line 2/2",
@@ -693,63 +700,44 @@ def build_persons(res, anchor_mode, kp_conf):
     return persons
 
 
-# подписи на экране (OpenCV не рисует кириллицу, поэтому латиница)
-KIND_LABEL = {"NO_GREEN": "pass without green", "ZONE": "2+ people in gate", "WIDE": "two in one box",
-              "HANDOVER": "card handover", "LIMIT": "escort limit", "CLIMB": "climb over",
-              "REVERSE": "wrong direction"}
+def draw_overlay(cv2, view, persons, gates, greens, painter):
+    """Рамки людей, зоны, линии, тумбы и индикаторы всех проёмов на кадре."""
+    for x in persons:
+        x1, y1, x2, y2 = map(int, x.box)
+        cv2.rectangle(view, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.circle(view, tuple(map(int, x.anchor)), 4, (0, 255, 0), -1)
+        cv2.putText(view, str(x.tid), (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        for w in x.wrists:
+            cv2.circle(view, tuple(map(int, w)), 4, (255, 0, 255), -1)
+    for g, is_green in zip(gates, greens):
+        pts = [tuple(map(int, q)) for q in g.zone]
+        for k in range(len(pts)):
+            cv2.line(view, pts[k], pts[(k + 1) % len(pts)], (255, 200, 0), 1)
+        cv2.line(view, tuple(map(int, g.a)), tuple(map(int, g.b)), (0, 0, 255), 2)
+        for a, b in g.barriers:
+            cv2.line(view, tuple(map(int, a)), tuple(map(int, b)), (255, 0, 255), 2)
+        cv2.rectangle(view, g.roi[:2], g.roi[2:], (0, 255, 0) if is_green else (0, 0, 255), 2)
+        painter.text(view, f"{g.name}: {painter.t('credits')} {len(g.credits)}", (int(g.a[0]), int(g.a[1]) - 8),
+                     0.55, (255, 255, 255))
+
+
 WINDOW = "Turnstile detector  (q - exit, f - fullscreen, space - pause)"
 
 
-def beep():
+def need_yolo():
     try:
-        import winsound
-        winsound.MessageBeep(winsound.MB_ICONHAND)        # асинхронно, не тормозит видео
-    except Exception:
-        pass
-
-
-def draw_hud(cv2, view, alerts, totals, now, paused=False):
-    """Баннер последней тревоги, список последних тревог и счётчики — прямо на кадре."""
-    h, w = view.shape[:2]
-    sc = max(0.5, min(1.2, w / 1280))
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    th = max(1, int(2 * sc))
-    if alerts and now - alerts[-1][0] < 4.0:
-        _, clock, gate, kind = alerts[-1]
-        bh = int(48 * sc)
-        cv2.rectangle(view, (0, 0), (w, bh), (0, 0, 200), -1)
-        cv2.putText(view, f"VIOLATION  gate {gate}: {kind} - {KIND_LABEL.get(kind, '')}  [{clock}]",
-                    (10, int(bh * 0.7)), font, 0.8 * sc, (255, 255, 255), th)
-    # последние тревоги справа
-    y = int(80 * sc)
-    for _, clock, gate, kind in list(alerts)[-6:][::-1]:
-        txt = f"{clock} {gate} {kind}"
-        (tw, _), _ = cv2.getTextSize(txt, font, 0.55 * sc, th)
-        cv2.rectangle(view, (w - tw - 16, y - int(20 * sc)), (w - 4, y + int(6 * sc)), (0, 0, 0), -1)
-        cv2.putText(view, txt, (w - tw - 10, y), font, 0.55 * sc, (80, 80, 255), th)
-        y += int(30 * sc)
-    # счётчики внизу
-    txt = "  ".join(f"{k}:{v}" for k, v in totals.most_common()) or "no violations"
-    txt = ("PAUSED  " if paused else "") + txt
-    cv2.rectangle(view, (0, h - int(34 * sc)), (w, h), (0, 0, 0), -1)
-    cv2.putText(view, txt, (10, h - int(10 * sc)), font, 0.6 * sc, (255, 255, 255), th)
-
-
-def waiting_frame(cv2, size, text):
-    import numpy as np
-    w, h = size
-    img = np.zeros((h, w, 3), np.uint8)
-    cv2.putText(img, text, (30, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-    return img
+        from ultralytics import YOLO
+        return YOLO
+    except ImportError:
+        sys.exit("Не установлены зависимости. Запусти start.bat (Windows) или start.command (Mac) "
+                 "либо выполни: pip install -r requirements.txt")
 
 
 def run(cfg, params, show=True):
     import cv2
-    try:
-        from ultralytics import YOLO
-    except ImportError:
-        sys.exit("Не установлены зависимости. Запусти start.bat (Windows) или start.command (Mac) "
-                 "либо выполни: pip install -r requirements.txt")
+    from hud import Painter, beep, draw_hud, waiting_frame
+    YOLO = need_yolo()
+    painter = Painter(params.ru_text)
 
     source = cfg["source"]
     file_mode = is_file_source(source)
@@ -790,7 +778,7 @@ def run(cfg, params, show=True):
                 frame, last_n = reader.get(last_n)
                 if frame is None:
                     if show and time.time() - last_frame_wall > 3:
-                        cv2.imshow(WINDOW, waiting_frame(cv2, size, "Waiting for video stream... (link may be expired)"))
+                        cv2.imshow(WINDOW, waiting_frame(painter, size))
                         if cv2.waitKey(200) & 0xFF == ord("q"):
                             break
                     else:
@@ -801,31 +789,16 @@ def run(cfg, params, show=True):
                 stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             res = model.track(frame, persist=True, classes=[0], conf=params.conf, imgsz=params.imgsz,
-                              tracker="bytetrack.yaml", verbose=False)[0]
+                              tracker="bytetrack.yaml", verbose=False, device=params.device or None)[0]
             persons = build_persons(res, anchor_mode, params.kp_conf)
 
             view = frame.copy()
-            for x in persons:
-                x1, y1, x2, y2 = map(int, x.box)
-                cv2.rectangle(view, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.circle(view, tuple(map(int, x.anchor)), 4, (0, 255, 0), -1)
-                cv2.putText(view, str(x.tid), (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                for w in x.wrists:
-                    cv2.circle(view, tuple(map(int, w)), 4, (255, 0, 255), -1)
-
-            events = []
+            events, greens = [], []
             for g in gates:
                 is_green = green_share(frame, g.roi, params) > params.green_frac
+                greens.append(is_green)
                 events += g.update(t, persons, is_green)
-                pts = [tuple(map(int, q)) for q in g.zone]
-                for k in range(len(pts)):
-                    cv2.line(view, pts[k], pts[(k + 1) % len(pts)], (255, 200, 0), 1)
-                cv2.line(view, tuple(map(int, g.a)), tuple(map(int, g.b)), (0, 0, 255), 2)
-                for a, b in g.barriers:
-                    cv2.line(view, tuple(map(int, a)), tuple(map(int, b)), (255, 0, 255), 2)
-                cv2.rectangle(view, g.roi[:2], g.roi[2:], (0, 255, 0) if is_green else (0, 0, 255), 2)
-                cv2.putText(view, f"{g.name}: credits {len(g.credits)}", (int(g.a[0]), int(g.a[1]) - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            draw_overlay(cv2, view, persons, gates, greens, painter)
 
             for e in events:
                 if e["type"] == "pass":
@@ -835,19 +808,19 @@ def run(cfg, params, show=True):
                     cv2.putText(shot, f"{e['gate']}: {e['kind']}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                     out.violation(stamp, e, shot)
-                    alerts.append((time.time(), stamp[-8:] if not file_mode else stamp, e["gate"], e["kind"]))
+                    alerts.append((time.time(), stamp[-8:] if not file_mode else stamp, None, e["gate"], e["kind"]))
                     totals[e["kind"]] += 1
                     if params.sound and show:
                         beep()
 
             if show:
                 size = (view.shape[1], view.shape[0])
-                draw_hud(cv2, view, alerts, totals, time.time())
+                draw_hud(painter, view, alerts, totals, time.time())
                 cv2.imshow(WINDOW, view)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord(" ") and file_mode:              # пауза — только для записи
                     paused = True
-                    draw_hud(cv2, view, alerts, totals, time.time(), paused=True)
+                    draw_hud(painter, view, alerts, totals, time.time(), paused=True)
                     cv2.imshow(WINDOW, view)
                     while paused:
                         key = cv2.waitKey(50) & 0xFF
@@ -916,7 +889,10 @@ def quick_start(config_path="cam.json"):
 
 def main():
     if len(sys.argv) == 1:
-        return quick_start()
+        if Path("cam.json").exists() and not Path("links.txt").exists():
+            return quick_start()                         # старый режим: одна камера в cam.json
+        import multicam
+        return multicam.wizard()
     ap = argparse.ArgumentParser(description="Детекция нарушений прохода через турникет")
     ap.add_argument("--config", default="cam.json")
     ap.add_argument("--source", help="ссылка на поток (RTSP / m3u8) или видеофайл; заменяет source из конфига")
@@ -924,13 +900,34 @@ def main():
     ap.add_argument("--calib", action="store_true", help="проверить распознавание индикатора")
     ap.add_argument("--selftest", action="store_true", help="проверка логики без камеры")
     ap.add_argument("--no-show", action="store_true", help="не показывать окно с видео")
+    ap.add_argument("--multi", action="store_true", help="все камеры из cameras/ и links.txt в одном окне")
+    ap.add_argument("--auto", action="store_true",
+                    help="авторазметка: всех камер из links.txt (или одной: --source и --camera)")
+    ap.add_argument("--camera", default="CAM-01", help="имя камеры для --auto с --source")
+    ap.add_argument("--observe", type=int, default=180, help="сколько секунд наблюдать при авторазметке")
+    ap.add_argument("--ru", action="store_true", help="подписи на экране по-русски")
     args = ap.parse_args()
 
     if args.selftest:
         sys.exit(0 if selftest() else 1)
+    if args.auto or args.multi:
+        import multicam
+        gp = multicam.global_params()
+        if args.ru:
+            gp["ru_text"] = True
+        if args.auto:
+            sources = {args.camera: args.source} if args.source else multicam.read_links()
+            if not sources:
+                sys.exit("Нет ссылок: укажи --source или заполни links.txt")
+            multicam.autosetup(sources, args.observe, multicam.make_params(gp), review=not args.no_show)
+        if args.multi:
+            multicam.run_many(multicam.load_cameras(), gp, show=not args.no_show)
+        return
     if args.setup:
         return setup_mode(args.config, args.source)
     cfg, params = load_config(args.config, args.source)
+    if args.ru:
+        params.ru_text = True
     if args.calib:
         return calib_mode(cfg, params)
     run(cfg, params, show=not args.no_show)
