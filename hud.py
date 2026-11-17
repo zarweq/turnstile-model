@@ -129,8 +129,9 @@ def grid_shape(n):
 MOSAIC_TOP, MOSAIC_BOTTOM = 52, 36          # полосы под баннер тревоги и счётчики — не закрывают камеры
 
 
-def mosaic(painter, tiles, names, alert_until, now, tile_w=384, tile_h=216):
-    """Склеивает кадры всех камер в сетку. Камера с недавней тревогой — в красной рамке."""
+def mosaic(painter, tiles, names, alert_until, now, tile_w=384, tile_h=216, labels=None):
+    """Склеивает кадры всех камер в сетку. Камера с недавней тревогой — в красной рамке.
+    labels — подписи плиток (например «CAM-07 · обучение 2/3»), по умолчанию имена камер."""
     n = len(tiles)
     rows, cols = grid_shape(n)
     canvas = np.zeros((MOSAIC_TOP + rows * tile_h + MOSAIC_BOTTOM, cols * tile_w, 3), np.uint8)
@@ -145,7 +146,8 @@ def mosaic(painter, tiles, names, alert_until, now, tile_w=384, tile_h=216):
         hot = alert_until.get(name, 0) > now
         cv2.rectangle(canvas, (x, y), (x + tile_w - 1, y + tile_h - 1), (0, 0, 255) if hot else (60, 60, 60),
                       4 if hot else 1)
-        painter.text(canvas, f"{i + 1}. {name}", (x + 8, y + 24), 0.55, (255, 255, 255), bg=(0, 0, 0))
+        label = labels[i] if labels else name
+        painter.text(canvas, f"{i + 1}. {label}", (x + 8, y + 24), 0.55, (255, 255, 255), bg=(0, 0, 0))
     return canvas
 
 

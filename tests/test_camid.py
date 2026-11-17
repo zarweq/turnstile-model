@@ -110,21 +110,15 @@ def test_wizard_pasted_links(tmp_path, monkeypatch):
     multicam.save_camera({"camera": "CAM-01", "source": "old", "gates": [td.SELFTEST_CFG]}, cams, scene(1))
     a = video(tmp_path / "a.avi", scene(5))                     # новая
     b = video(tmp_path / "b.avi", other_day(scene(1), 3))       # это CAM-01
-    answers = iter([f"смотри: {a}", b, "", "y", "", "p", "5"])  # вставка, пустая строка, ru, старт, по людям, 5 мин
+    answers = iter([f"смотри: {a}", b, "", "y", "", ""])        # вставка, пустая строка, ru, старт, «всё само»
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    monkeypatch.setattr("autosetup.propose_static", lambda frame: ([], ["не найдено"]))
     calls = {}
-
-    def fake_auto(sources, sec, params, review, cam_dir):
-        calls.update(auto=dict(sources), sec=sec)
-        for n, src in sources.items():
-            multicam.save_camera({"camera": n, "source": src, "gates": [td.SELFTEST_CFG]}, cam_dir)
-
-    monkeypatch.setattr(multicam, "autosetup", fake_auto)
     monkeypatch.setattr(multicam, "run_many", lambda cfgs, gp, show: calls.update(
-        run=sorted((c["camera"], c["source"]) for c in cfgs), ru=gp["ru_text"]))
+        run=sorted((c["camera"], c["source"], bool(c.get("auto_learn"))) for c in cfgs), ru=gp["ru_text"]))
     multicam.wizard()
-    assert calls == {"auto": {"CAM-02": a}, "sec": 300, "ru": True,
-                     "run": [("CAM-01", b), ("CAM-02", a)]}
+    assert calls == {"ru": True, "run": [("CAM-01", b, False), ("CAM-02", a, True)]}
+    assert (cams / "CAM-02_ref.jpg").exists()                  # образец вида новой камеры сохранён
     assert a in (tmp_path / "links.txt").read_text(encoding="utf-8")
 
 

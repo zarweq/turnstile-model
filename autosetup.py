@@ -386,3 +386,55 @@ def propose_static(frame, stands=None, lights=None, model=None):
         if g["auto"]["check"]:
             notes.append(f"проём {g['name']}: проверьте ({g['auto']['why'] or 'стойки без огоньков'})")
     return gates, notes
+
+
+# ============================ ОБУЧЕНИЕ НА ХОДУ ============================
+class Learner:
+    """
+    Разметка ставится сама во время обычной работы. Программа копит:
+      * какие места кадра мигают красным/зелёным (индикаторы),
+      * траектории людей (по номерам трекера).
+    Как только у индикатора, который хоть раз загорелся зелёным, набралось min_passes проходов,
+    проём строится так же, как при авторазметке по людям, и сразу начинает работать.
+    """
+
+    def __init__(self, shape, params=None, anchor="foot", min_passes=3, every=10.0, max_tracks=3000):
+        self.finder = IndicatorFinder(shape, params)
+        self.tracks = TrackCollector(anchor)
+        self.shape, self.min_passes, self.every, self.max_tracks = shape, min_passes, every, max_tracks
+        self.last_try = None
+        self.progress = 0            # больше всего проходов у одного индикатора
+        self.done = False
+
+    def add(self, frame, persons):
+        self.finder.add(frame)
+        if self.finder.n >= 30000:                               # счётчики не переполняются за сутки работы
+            self.finder.red //= 2
+            self.finder.green //= 2
+            self.finder.n //= 2
+        self.tracks.add([p.box for p in persons], [p.tid for p in persons])
+        if len(self.tracks.tracks) > self.max_tracks:            # память не растёт: старые траектории забываем
+            for k in list(self.tracks.tracks)[: len(self.tracks.tracks) - self.max_tracks]:
+                del self.tracks.tracks[k]
+
+    def try_build(self, t, camera="camera", source=""):
+        """Раз в every секунд: новые проёмы (список) или None, если учиться ещё рано."""
+        if self.last_try is not None and t - self.last_try < self.every:
+            return None
+        self.last_try = t
+        inds = [i for i in self.finder.find() if i["toggled"]]
+        if not inds:
+            return None
+        tracks = self.tracks.moving()
+        widths = [w for tr in tracks for w in tr["widths"]] or [self.shape[1] / 20]
+        groups = split_tracks(tracks, inds, lambda gi: 1.5 * float(np.median(widths)))
+        self.progress = max((len(g) for g in groups), default=0)
+        cfg, _ = build_config(camera, source, self.shape, inds, tracks)
+        gates = [g for g in cfg["gates"] if g["auto"]["passes"] >= self.min_passes]
+        if not gates:
+            return None
+        for k, g in enumerate(gates):
+            g["name"] = chr(ord("A") + k)
+            g["auto"]["learned"] = True
+        self.done = len(gates) >= len(inds)
+        return gates

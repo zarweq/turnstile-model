@@ -125,7 +125,7 @@ def load_cameras(cam_dir=CAM_DIR, links_path=LINKS):
     for name, cfg in all_cameras(cam_dir).items():
         if name in links:
             cfg["source"] = links[name]
-        if cfg.get("gates"):
+        if cfg.get("gates") or needs_learning(cfg):
             cams.append(cfg)
     return cams
 
@@ -187,7 +187,7 @@ def resolve_links(pairs, cam_dir=CAM_DIR, show=False, timeout=20.0):
             cfg = cams[r["camera"]]
             cfg["source"], cfg["source_key"] = r["url"], url_key(r["url"])
             save_camera(cfg, cam_dir, frames[r["url"]] if r["camera"] not in refs else None)
-            if cfg.get("gates"):
+            if cfg.get("gates") or needs_learning(cfg):
                 today.append(cfg)
         elif r["why"] == "новая камера":
             name = hints.get(r["url"]) if hints.get(r["url"]) not in cams else None
@@ -298,10 +298,16 @@ def open_source(source, fps_limit):
 
 
 # ============================ ОДНА КАМЕРА В ОБЩЕМ ЦИКЛЕ ============================
+def needs_learning(cfg):
+    return bool(cfg.get("auto_learn")) or not cfg.get("gates")
+
+
 class Camera:
-    def __init__(self, cfg, params):
+    def __init__(self, cfg, params, cam_dir=CAM_DIR):
         from tracker import SimpleTracker
-        self.cfg, self.p = cfg, params
+        self.cfg, self.p, self.cam_dir = cfg, params, cam_dir
+        self.learner = None
+        self.learn = needs_learning(cfg)
         self.name = cfg.get("camera", "camera")
         self.anchor = cfg.get("anchor", "foot")
         self.gates = [GateLogic(g, params) for g in cfg["gates"]]
@@ -321,6 +327,44 @@ class Camera:
 
     def stamp(self, t):
         return f"video+{t:.1f}s" if self.file else datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+
+    def status(self, ru=True):
+        if not self.learn:
+            return ""
+        n = self.learner.progress if self.learner else 0
+        need = self.learner.min_passes if self.learner else 3
+        if self.cfg.get("gates") and not self.cfg.get("learned"):
+            return f"по картинке, уточняю {n}/{need}" if ru else f"guess, learning {n}/{need}"
+        return f"обучение {n}/{need}" if ru else f"learning {n}/{need}"
+
+    def learn_step(self, frame, persons, t):
+        """Обучение на ходу: копим индикаторы и траектории, при успехе — новая разметка сразу в работу."""
+        from autosetup import Learner, draw_markup
+        if not self.learn:
+            return False
+        if self.learner is None:
+            self.learner = Learner(frame.shape, self.p, self.anchor)
+        self.learner.add(frame, persons)
+        gates = self.learner.try_build(t, self.name, self.cfg.get("source", ""))
+        if not gates or (self.cfg.get("learned") and len(gates) <= len(self.cfg.get("gates", []))):
+            if self.learner.done and self.cfg.get("learned"):
+                self.learn = False
+            return False                                   # нового ничего — текущую разметку не трогаем
+        self.cfg["gates"] = gates
+        self.cfg["learned"] = True
+        self.cfg["auto_learn"] = not self.learner.done
+        self.gates = [GateLogic(g, self.p) for g in gates]
+        save_camera(self.cfg, self.cam_dir)
+        try:
+            import cv2
+            cv2.imwrite(str(Path(self.cam_dir) / f"{self.name}_auto.jpg"), draw_markup(frame, self.cfg))
+        except Exception:
+            pass
+        if self.learner.done:
+            self.learn = False
+        print(f"[+] {self.name}: разметка выучена по проходам людей — проёмов {len(gates)}"
+              f"{'' if self.learner.done else ' (учусь дальше: есть индикаторы без проёма)'}")
+        return True
 
 
 def persons_from(res, cam, t):
@@ -348,11 +392,11 @@ class AllOutput:
 
 
 # ============================ ГЛАВНЫЙ ЦИКЛ ============================
-def run_many(cfgs, base_params=None, show=True, max_seconds=None, model=None):
+def run_many(cfgs, base_params=None, show=True, max_seconds=None, model=None, cam_dir=CAM_DIR):
     import cv2
     from hud import Painter, beep, draw_hud, mosaic, tile_at
     base = base_params or {}
-    cams = [Camera(c, make_params(base, c.get("params"))) for c in cfgs]
+    cams = [Camera(c, make_params(base, c.get("params")), cam_dir) for c in cfgs]
     bad = [c.name for c in cams if c.reader is None]
     if bad:
         print("Нет ссылки или файла для камер:", ", ".join(bad), "— проверь links.txt")
@@ -394,6 +438,7 @@ def run_many(cfgs, base_params=None, show=True, max_seconds=None, model=None):
                                         device=p0.device or None, verbose=False)
                 for (cam, frame, t), res in zip(batch, results):
                     persons = persons_from(res, cam, t)
+                    cam.learn_step(frame, persons, t)
                     events, greens = [], []
                     for g in cam.gates:
                         is_green = green_share(frame, g.roi, cam.p) > cam.p.green_frac
@@ -407,6 +452,8 @@ def run_many(cfgs, base_params=None, show=True, max_seconds=None, model=None):
                         if e["type"] == "pass":
                             cam.out.passed(stamp, e)
                             continue
+                        if cam.cfg.get("gates") and not cam.cfg.get("learned") and cam.learn:
+                            e["text"] += " [разметка по картинке, ещё не уточнена]"
                         shot = view.copy()
                         painter.text(shot, f"{cam.name} {e['gate']}: {e['kind']}", (10, 30), 0.9, (0, 0, 255))
                         cam.out.violation(stamp, e, shot)
@@ -424,9 +471,10 @@ def run_many(cfgs, base_params=None, show=True, max_seconds=None, model=None):
                 continue
             last_draw = now
             names = [c.name for c in cams]
+            labels = [f"{c.name}  {c.status(painter.lang == 'ru')}".strip() for c in cams]
             if zoom is None:
                 tiles = [c.view if now - c.last_frame_wall < 10 or c.file else None for c in cams]
-                canvas = mosaic(painter, tiles, names, alert_until, now)
+                canvas = mosaic(painter, tiles, names, alert_until, now, labels=labels)
             else:
                 c = cams[zoom]
                 canvas = c.view.copy() if c.view is not None else mosaic(painter, [None], [c.name], {}, now)
@@ -625,36 +673,53 @@ def wizard(observe_sec=180, cam_dir=CAM_DIR, links_path=LINKS):
     if not gp_path.exists():
         ru = _ask("Подписи на экране по-русски? (y — да, Enter — латиница): ").lower() in ("y", "д", "да", "yes")
         gp_path.write_text(json.dumps({"ru_text": ru, "cam_fps": 8}, ensure_ascii=False, indent=2), encoding="utf-8")
-    params = make_params(global_params(cam_dir))
 
     today, new, _ = resolve_links(pairs, cam_dir, show=_gui_available())
     print(f"\nУзнано размеченных камер: {len(today)}, новых: {len(new)}")
-    choice = _ask("Enter — старт, a — переразметить ВСЕ сегодняшние камеры автоматически: ").lower()
+    choice = _ask("Enter — старт, a — разметить ВСЕ сегодняшние камеры заново: ").lower()
     if choice == "a":
         new.update({c["camera"]: c["source"] for c in today})
     if new:
-        print(f"\nРазметка {len(new)} новых камер. Как размечать?\n"
-              "  Enter — по картинке: программа сама ищет турникеты, вы проверяете и поправляете мышкой\n"
-              f"  p     — по проходам людей: смотрит видео ~{observe_sec // 60} мин (нужны люди)\n"
+        print(f"\nНовых камер: {len(new)}. Как размечать?\n"
+              "  Enter — всё само: точки ставятся по картинке сразу, а потом программа сама уточняет их\n"
+              "          по проходящим людям прямо во время работы (кликать ничего не нужно)\n"
+              "  e     — то же, но показать предложение по картинке для проверки мышкой\n"
               "  m     — вручную с нуля (3 клика на проём)")
         how = _ask("Выбор: ").lower()
-        if how == "p":
-            mins = _ask(f"Сколько минут наблюдать? Нужно хотя бы 3 прохода через каждый проём "
-                        f"(Enter — {observe_sec // 60}): ")
-            if mins.replace(",", ".").replace(".", "", 1).isdigit():
-                observe_sec = int(float(mins.replace(",", ".")) * 60)
-            autosetup(new, observe_sec, params, review=True, cam_dir=cam_dir)
-        else:
+        if how in ("e", "m"):
             for n, src in new.items():
                 print(f"\n--- {n} ---")
-                setup_mode(str(cam_dir / f"{n}.json"), src, camera=n, auto=how != "m", anchor="foot")
+                setup_mode(str(cam_dir / f"{n}.json"), src, camera=n, auto=how == "e", anchor="foot")
+        else:
+            auto_new_cameras(new, cam_dir)
         marked = all_cameras(cam_dir)
         today = [c for c in today if c["camera"] not in new]
-        today += [marked[n] for n in new if n in marked and marked[n].get("gates")]
+        today += [marked[n] for n in new if n in marked and (marked[n].get("gates") or needs_learning(marked[n]))]
     if not today:
         sys.exit("Нет ни одной размеченной камеры")
     print("\nОткрываю окно. Клик по камере — крупно, Esc — назад к мозаике, f — весь экран, q — выход.")
     run_many(today, global_params(cam_dir), show=True)
+
+
+def auto_new_cameras(sources, cam_dir=CAM_DIR):
+    """Новые камеры без единого клика: предложение по картинке + обучение на ходу."""
+    from autosetup import propose_static
+    from camid import grab_frame
+    for name, src in sources.items():
+        frame = grab_frame(src)
+        if frame is None:
+            print(f"  {name}: ссылка не открылась — пропускаю")
+            continue
+        try:
+            gates, _ = propose_static(frame)
+        except Exception as e:                              # нет модели, нет сети — просто учимся на ходу
+            print(f"  {name}: поиск по картинке не удался ({e})")
+            gates = []
+        cfg = {"camera": name, "source": src, "anchor": "foot", "gates": gates, "params": {},
+               "auto_learn": True, "learned": False}
+        save_camera(cfg, cam_dir, frame)
+        what = f"по картинке найдено проёмов: {len(gates)}" if gates else "по картинке турникеты не найдены"
+        print(f"  {name}: {what}; дальше разметка уточнится сама по проходящим людям")
 
 
 def _gui_available():

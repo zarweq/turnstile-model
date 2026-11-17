@@ -85,3 +85,29 @@ def test_build_config_two_turnstiles_side_by_side():
 def test_no_traffic_gives_note():
     cfg, notes = build_config("C", "s", (480, 720), [{"box": [10, 10, 20, 20], "toggled": True}], [])
     assert cfg["gates"] == [] and notes
+
+
+def test_learner_marks_gate_by_itself():
+    """Камера без разметки: индикатор мигает, люди проходят — проём появляется сам."""
+    from autosetup import Learner
+    from turnstile_detector import Person
+    lr = Learner((480, 720), every=1.0)
+    rng = np.random.default_rng(1)
+    t, gates, tid = 0.0, None, 0
+    for walker in range(5):                                   # 5 человек через проём у x=360
+        tid += 1
+        off_far, off_w = rng.uniform(-60, 60), rng.uniform(-4, 4)
+        for k in range(30):
+            y = 100 + k * 10                                  # идут сверху вниз, «талия» на y=250
+            kk = min(abs(y - 250) / 150, 1)
+            x = 360 + off_w + (off_far - off_w) * kk
+            img = np.full((480, 720, 3), 110, np.uint8)
+            cv2.circle(img, (380, 220), 9, GREEN if 5 <= k < 9 else RED, 3)
+            box = (x - 25, y - 150, x + 25, y)
+            lr.add(img, [Person(tid, box, (x, y))])
+            t += 0.1
+            gates = lr.try_build(t, "CAM-L", "src") or gates
+    assert gates and len(gates) == 1 and lr.done
+    (ax, ay), (bx, by) = gates[0]["line"]
+    assert abs((ax + bx) / 2 - 360) < 15 and abs((ay + by) / 2 - 250) < 30
+    assert abs((gates[0]["indicator"][0] + gates[0]["indicator"][2]) / 2 - 380) < 10
